@@ -1,0 +1,21 @@
+version: 1
+extensions:
+  - id: commit-msg
+    path: ./commit-msg
+    command: /gen-commit-msg
+    description: Generate an English commit message from staged changes.
+
+  - id: pr-description
+    path: ./pr-description
+    command: /gen-pr-desc
+    description: Generate a Markdown pull request description from branch commits.
+
+  - id: review
+    path: ./review
+    command: /review
+    description: Review the current branch and optionally apply fixes finding by finding.
+
+  - id: commands-whitelist
+    path: ./commands-whitelist
+    command: /whitelist
+    description: Review shell and file-edit actions and persist allow or deny rules.

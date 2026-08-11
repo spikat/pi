@@ -1,631 +1,188 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { analyseShell, classification, loadStore, matchesRule, normalizeRule, ruleFor, saveStore, type CommandPart, type RuleState, type Store } from "./core.js";
 
-const EXTENSION_NAME = "commands whitelist";
-const STORE_FILE = "commands-whitelist.json";
+const NAME = "commands whitelist";
+const FILE = "commands-whitelist.json";
+type Choice = { part: CommandPart; state: RuleState; args: number; persisted?: string };
+type GateResult = { action: "allow" } | { action: "block"; reason: string } | { action: "prompt"; prompt: string };
+const sessionEditDirectories = new Set<string>();
+const sessionEditFiles = new Set<string>();
 
-type Store = {
-	version: 1;
-	actionKeys: string[];
-	globalActionKeys: string[];
-	editDirectories: string[];
-};
+function gitRoot(cwd: string): string | undefined { let current = resolve(cwd); while (true) { if (existsSync(resolve(current, ".git"))) return current; const parent = dirname(current); if (parent === current) return undefined; current = parent; } }
+function storePath(cwd: string): string { return resolve(gitRoot(cwd) ?? cwd, CONFIG_DIR_NAME, FILE); }
+function pathFor(cwd: string, raw: unknown): string | undefined { if (typeof raw !== "string" || !raw) return undefined; const value = raw.startsWith("@") ? raw.slice(1) : raw; return isAbsolute(value) ? resolve(value) : resolve(cwd, value); }
+function within(parent: string, child: string): boolean { const rel = relative(parent, child); return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel)); }
+function marker(state: RuleState): string { return state === "allow" ? "✅" : state === "deny" ? "❌" : "🔁"; }
+function footer(): string { return "↑↓ select · ←→ arguments · Space state · Enter validate/send · Ctrl+C cancel · h help"; }
+function detailedHelp(): string[] { return ["Commands whitelist", "🔁 authorizes this session only; ✅ saves an allow rule; ❌ saves a deny rule.", "←/→ changes the number of literal arguments; * matches all remaining arguments.", "Enter on ‘Validate current selection’ applies choices. A denied part blocks the whole shell command.", "The prompt input cancels the pending command and sends its text to the assistant.", "Use /whitelist to list, add, edit, and delete saved rules.", "Esc returns to the menu."]; }
 
-type WhitelistEntry =
-	| { type: "action"; index: number; label: string; value: string }
-	| { type: "globalAction"; index: number; label: string; value: string }
-	| { type: "editDirectory"; index: number; label: string; value: string };
-
-type WhitelistMenuResult =
-	| { action: "quit" }
-	| { action: "delete"; entry: WhitelistEntry }
-	| { action: "edit"; entry: WhitelistEntry };
-
-const DEFAULT_STORE: Store = {
-	version: 1,
-	actionKeys: [],
-	globalActionKeys: [],
-	editDirectories: [],
-};
-
-function findGitRoot(start: string): string | undefined {
-	let current = resolve(start);
-	while (true) {
-		if (existsSync(resolve(current, ".git"))) return current;
-		const parent = dirname(current);
-		if (parent === current) return undefined;
-		current = parent;
+class PromptLine {
+	text = ""; cursor = 0;
+	handle(data: string): boolean {
+		if (matchesKey(data, Key.left)) { this.cursor = Math.max(0, this.cursor - 1); return true; }
+		if (matchesKey(data, Key.right)) { this.cursor = Math.min(this.text.length, this.cursor + 1); return true; }
+		if (matchesKey(data, Key.backspace)) { if (this.cursor) { this.text = this.text.slice(0, this.cursor - 1) + this.text.slice(this.cursor); this.cursor--; } return true; }
+		if (matchesKey(data, Key.delete)) { this.text = this.text.slice(0, this.cursor) + this.text.slice(this.cursor + 1); return true; }
+		if (data.length === 1 && data >= " ") { this.text = this.text.slice(0, this.cursor) + data + this.text.slice(this.cursor); this.cursor++; return true; }
+		return false;
 	}
+	render(active: boolean): string { const before = this.text.slice(0, this.cursor); const at = this.text[this.cursor] ?? " "; const after = this.text.slice(this.cursor + 1); return `  Enter a prompt for the assistant: ${before}${active ? `\x1b[7m${at}\x1b[27m` : this.text || "[... ]"}${active ? after : ""}`; }
 }
 
-function getPiDirectory(cwd: string): string {
-	return resolve(findGitRoot(cwd) ?? cwd, ".pi");
-}
-
-function normalizePath(cwd: string, rawPath: unknown): string | undefined {
-	if (typeof rawPath !== "string" || rawPath.length === 0) return undefined;
-	const withoutAt = rawPath.startsWith("@") ? rawPath.slice(1) : rawPath;
-	return isAbsolute(withoutAt) ? resolve(withoutAt) : resolve(cwd, withoutAt);
-}
-
-function isInsideOrEqual(parent: string, child: string): boolean {
-	const rel = relative(resolve(parent), resolve(child));
-	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
-}
-
-function stableStringify(value: unknown): string {
-	if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
-	if (value && typeof value === "object") {
-		const record = value as Record<string, unknown>;
-		return `{${Object.keys(record)
-			.sort()
-			.map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`)
-			.join(",")}}`;
-	}
-	return JSON.stringify(value);
-}
-
-async function loadStore(path: string): Promise<Store> {
-	try {
-		const raw = await readFile(path, "utf8");
-		const parsed = JSON.parse(raw) as Partial<Store>;
-		return {
-			version: 1,
-			actionKeys: Array.isArray(parsed.actionKeys) ? parsed.actionKeys.filter((v) => typeof v === "string") : [],
-			globalActionKeys: Array.isArray(parsed.globalActionKeys) ? parsed.globalActionKeys.filter((v) => typeof v === "string") : [],
-			editDirectories: Array.isArray(parsed.editDirectories)
-				? parsed.editDirectories.filter((v) => typeof v === "string").map((v) => resolve(v))
-				: [],
+async function showGate(ctx: ExtensionContext, choices: Choice[], global?: string): Promise<GateResult> {
+	if (ctx.mode !== "tui") return { action: "block", reason: `${NAME}: no interactive UI is available` };
+	return ctx.ui.custom<GateResult>((tui, theme, _kb, done) => {
+		let selected = 0; let help = false; const prompt = new PromptLine(); const validateIndex = choices.length; const promptIndex = choices.length + 1;
+		const render = (width: number): string[] => {
+			if (help) return detailedHelp().map((line) => truncateToWidth(line, width));
+			const lines = [theme.fg("accent", theme.bold("Review shell command"))];
+			if (global) lines.push(truncateToWidth(theme.fg("dim", `Original: ${global}`), width));
+			for (let i = 0; i < choices.length; i++) { const c = choices[i]!; const label = `${marker(c.state)} ${ruleFor(c.part, c.args)}${c.part.pythonScript ? " (one time only)" : ""}`; const row = `${i === selected ? "› " : "  "}${label}`; lines.push(truncateToWidth(i === selected ? theme.bg("selectedBg", theme.fg("accent", row)) : row, width)); }
+			const validate = `${selected === validateIndex ? "› " : "  "}Validate current selection`;
+			lines.push(theme.bg(selected === validateIndex ? "selectedBg" : "toolPendingBg", truncateToWidth(validate, width)));
+			const input = prompt.render(selected === promptIndex);
+			lines.push(selected === promptIndex ? theme.bg("selectedBg", truncateToWidth(input, width)) : truncateToWidth(input, width));
+			lines.push(theme.fg("dim", footer())); return lines;
 		};
-	} catch {
-		return { ...DEFAULT_STORE };
+		return { invalidate() {}, render, handleInput(data: string) {
+			if (help) { if (matchesKey(data, Key.escape)) { help = false; tui.requestRender(); } return; }
+			if (matchesKey(data, Key.ctrl("c"))) return done({ action: "block", reason: `${NAME}: cancelled by user` });
+			if (data === "h") { help = true; tui.requestRender(); return; }
+			if (selected === promptIndex) { if (matchesKey(data, Key.enter)) return done({ action: "prompt", prompt: prompt.text.trim() }); if (prompt.handle(data)) { tui.requestRender(); return; } }
+			if (matchesKey(data, Key.up)) { selected = Math.max(0, selected - 1); tui.requestRender(); return; }
+			if (matchesKey(data, Key.down)) { selected = Math.min(promptIndex, selected + 1); tui.requestRender(); return; }
+			if (selected < choices.length) {
+				const choice = choices[selected]!;
+				if (choice.part.pythonScript) {
+					// Python script execution is opaque: it can only be allowed once or denied.
+					if (matchesKey(data, Key.space)) choice.state = choice.state === "deny" ? "undecided" : "deny";
+				} else if (matchesKey(data, Key.left)) choice.args = Math.max(0, choice.args - 1);
+				else if (matchesKey(data, Key.right)) choice.args = Math.min(choice.part.displayWords.filter((w) => w !== "*").length - 1, choice.args + 1);
+				else if (matchesKey(data, Key.space)) choice.state = choice.state === "undecided" ? "allow" : choice.state === "allow" ? "deny" : "undecided";
+				if (matchesKey(data, Key.enter)) selected = Math.min(promptIndex, selected + 1);
+				tui.requestRender(); return;
+			}
+			if (selected === validateIndex && matchesKey(data, Key.enter)) done({ action: "allow" });
+		} };
+	});
+}
+
+async function gateBash(pi: ExtensionAPI, ctx: ExtensionContext, command: string): Promise<{ block: true; reason: string } | undefined> {
+	if (!command.trim()) return { block: true, reason: `${NAME}: empty command` };
+	if (command.trim().startsWith("#")) return undefined;
+	const result = analyseShell(command);
+	const parts = result.unsupported ? result.parts : result.parts;
+	const store = await loadStore(storePath(ctx.cwd));
+	const choices: Choice[] = parts.map((part) => {
+		const found = [...store.whitelist, ...store.blacklist].find((r) => matchesRule(r, part));
+		// A Python script may never be persistently allowed, even through an existing
+		// broad allow rule. Stored deny rules still block it immediately.
+		const state = part.pythonScript ? (store.blacklist.some((r) => matchesRule(r, part)) ? "deny" : "undecided") : classification(store, part);
+		return { part, state, args: Math.max(0, (found ? found.split(" ").length - 2 : part.displayWords.filter((w) => w !== "*").length - 1)), persisted: found };
+	});
+	const denied = choices.filter((c) => c.state === "deny");
+	if (denied.length) return { block: true, reason: `${NAME}: blocked command\nOriginal: ${command}\nDenied: ${denied.map((c) => `${c.part.original} (rule: ${c.persisted})`).join("; ")}` };
+	if (choices.length && choices.every((c) => c.state === "allow")) return undefined;
+	const answer = await showGate(ctx, choices, command);
+	if (answer.action === "prompt") { if (answer.prompt) pi.sendUserMessage(answer.prompt, { deliverAs: "steer" }); return { block: true, reason: `${NAME}: command cancelled; prompt sent to assistant` }; }
+	if (answer.action === "block") return { block: true, reason: answer.reason };
+	for (const c of choices) {
+		if (c.state === "undecided") continue;
+		if (c.part.pythonScript && c.state === "allow") continue;
+		const rule = ruleFor(c.part, c.args);
+		if (c.persisted && c.persisted !== rule) {
+			store.whitelist = store.whitelist.filter((value) => value !== c.persisted);
+			store.blacklist = store.blacklist.filter((value) => value !== c.persisted);
+		}
+		if (c.state === "allow") { store.blacklist = store.blacklist.filter((r) => r !== rule); if (!store.whitelist.includes(rule)) store.whitelist.push(rule); }
+		else { store.whitelist = store.whitelist.filter((r) => r !== rule); if (!store.blacklist.includes(rule)) store.blacklist.push(rule); }
 	}
-}
-
-async function saveStore(path: string, store: Store): Promise<void> {
-	await mkdir(dirname(path), { recursive: true });
-	const normalized: Store = {
-		version: 1,
-		actionKeys: [...new Set(store.actionKeys)].sort(),
-		globalActionKeys: [...new Set(store.globalActionKeys)].sort(),
-		editDirectories: [...new Set(store.editDirectories.map((v) => resolve(v)))].sort(),
-	};
-	await writeFile(path, `${JSON.stringify(normalized, null, 2)}\n`, "utf8");
-}
-
-function getPathInput(input: unknown): unknown {
-	if (!input || typeof input !== "object") return undefined;
-	return (input as Record<string, unknown>).path;
-}
-
-function getPrimaryPath(cwd: string, toolName: string, input: unknown): string | undefined {
-	if (!input || typeof input !== "object") return undefined;
-	const record = input as Record<string, unknown>;
-
-	// Built-in read/write/edit use `path`. ls/grep/find/head/tail/rg commonly use `path` or `directory`.
-	const candidates = [record.path, record.directory, record.cwd];
-	for (const candidate of candidates) {
-		const normalized = normalizePath(cwd, candidate);
-		if (normalized) return normalized;
-	}
-
-	// If no path is supplied for read-like tools, pi usually defaults to cwd.
-	if (["ls", "grep", "find", "head", "tail", "wc", "rg"].includes(toolName)) return resolve(cwd);
+	if (store.whitelist.some((r) => store.blacklist.includes(r))) return { block: true, reason: `${NAME}: whitelist/blacklist conflict` };
+	if (choices.some((c) => c.state !== "undecided")) await saveStore(storePath(ctx.cwd), store);
+	const explicitDeny = choices.filter((c) => c.state === "deny");
+	if (explicitDeny.length) return { block: true, reason: `${NAME}: command denied\nOriginal: ${command}\nDenied: ${explicitDeny.map((c) => c.part.original).join("; ")}` };
 	return undefined;
 }
 
-function isReadLikeTool(toolName: string): boolean {
-	return ["read", "ls", "grep", "find", "head", "tail", "wc", "rg"].includes(toolName) || toolName.endsWith(".read");
+async function showEditGate(ctx: ExtensionContext, title: string): Promise<{ choice: 1 | 2 | 3 | 4; persistent: boolean } | undefined> {
+	if (ctx.mode !== "tui") return undefined;
+	return ctx.ui.custom((tui, theme, _kb, done) => { let selected = 0; const persistent = [false, false]; const labels = ["1. Allow a directory", "2. Allow this file", "3. Deny", "4. Enter a prompt for the assistant"]; return { invalidate() {}, render(width: number) { return [theme.fg("accent", title), ...labels.map((label, index) => { const status = index < 2 ? (persistent[index] ? "✅" : "🔁") : index === 2 ? "❌" : "  "; const row = `${selected === index ? "› " : "  "}${status} ${label}`; return truncateToWidth(selected === index ? theme.bg("selectedBg", row) : row, width); }), theme.fg("dim", "↑↓ select · Space session/persist · Enter confirm · Ctrl+C cancel")]; }, handleInput(data: string) { if (matchesKey(data, Key.ctrl("c"))) return done(undefined); if (matchesKey(data, Key.up)) selected = Math.max(0, selected - 1); else if (matchesKey(data, Key.down)) selected = Math.min(3, selected + 1); else if (matchesKey(data, Key.space) && selected < 2) persistent[selected] = !persistent[selected]; else if (matchesKey(data, Key.enter)) done({ choice: (selected + 1) as 1 | 2 | 3 | 4, persistent: selected < 2 && persistent[selected] }); tui.requestRender(); } }; });
 }
 
-function hasWriteRedirection(command: string): boolean {
-	// Allow input redirections (`< file`) and `>` inside quotes (e.g. sed 's/a/>/g'),
-	// but block stdout/stderr/read-write redirections that can create/modify files.
-	let quote: "'" | '"' | undefined;
-	let escaped = false;
-
-	for (let i = 0; i < command.length; i++) {
-		const char = command[i]!;
-		const previous = command[i - 1];
-		const next = command[i + 1];
-
-		if (escaped) {
-			escaped = false;
-			continue;
-		}
-		if (char === "\\" && quote !== "'") {
-			escaped = true;
-			continue;
-		}
-		if ((char === "'" || char === '"') && !quote) {
-			quote = char;
-			continue;
-		}
-		if (char === quote) {
-			quote = undefined;
-			continue;
-		}
-		if (quote) continue;
-
-		if (char === ">") return true;
-		if (char === "<" && next === ">") return true;
-		if (char === "&" && previous === ">") return true;
-	}
-
-	return false;
+async function gateEdit(pi: ExtensionAPI, ctx: ExtensionContext, toolName: string, input: unknown): Promise<{ block: true; reason: string } | undefined> {
+	const path = pathFor(ctx.cwd, input && typeof input === "object" ? (input as { path?: unknown }).path : undefined);
+	if (!path) return { block: true, reason: `${NAME}: ${toolName} requires a path` };
+	const store = await loadStore(storePath(ctx.cwd));
+	if (store.editFiles.includes(path) || sessionEditFiles.has(path) || store.editDirectories.some((d) => within(d, path)) || [...sessionEditDirectories].some((d) => within(d, path))) return undefined;
+	if (!ctx.hasUI) return within(resolve(ctx.cwd), path) ? undefined : { block: true, reason: `${NAME}: ${toolName} blocked without UI outside current directory` };
+	const selected = await showEditGate(ctx, `${toolName}: ${path}`);
+	if (!selected || selected.choice === 3) return { block: true, reason: `${NAME}: ${toolName} denied` };
+	if (selected.choice === 4) { const prompt = await ctx.ui.editor("Enter a prompt for the assistant"); if (prompt?.trim()) pi.sendUserMessage(prompt.trim(), { deliverAs: "steer" }); return { block: true, reason: `${NAME}: ${toolName} cancelled` }; }
+	if (selected.choice === 1) { const chosen = await ctx.ui.editor("Allowed directory", resolve(ctx.cwd)); if (!chosen?.trim()) return { block: true, reason: `${NAME}: directory permission cancelled` }; const dir = resolve(chosen.trim()); if (selected.persistent) { store.editDirectories.push(dir); await saveStore(storePath(ctx.cwd), store); } else sessionEditDirectories.add(dir); return undefined; }
+	if (selected.persistent) { store.editFiles.push(path); await saveStore(storePath(ctx.cwd), store); } else sessionEditFiles.add(path); return undefined;
 }
 
-function splitShellSegments(command: string): string[] | undefined {
-	const segments: string[] = [];
-	let current = "";
-	let quote: "'" | '"' | undefined;
-	let escaped = false;
-
-	for (let i = 0; i < command.length; i++) {
-		const char = command[i]!;
-		const next = command[i + 1];
-
-		if (escaped) {
-			current += char;
-			escaped = false;
-			continue;
-		}
-		if (char === "\\" && quote !== "'") {
-			current += char;
-			escaped = true;
-			continue;
-		}
-		if ((char === "'" || char === '"') && !quote) {
-			quote = char;
-			current += char;
-			continue;
-		}
-		if (char === quote) {
-			quote = undefined;
-			current += char;
-			continue;
-		}
-		if (!quote && (char === "|" || char === ";" || char === "&")) {
-			if (current.trim()) segments.push(current.trim());
-			current = "";
-			if ((char === "|" && next === "|") || (char === "&" && next === "&")) i++;
-			continue;
-		}
-		current += char;
-	}
-
-	if (quote) return undefined;
-	if (current.trim()) segments.push(current.trim());
-	return segments;
+function helpText(): string { return "Usage: /whitelist [list|allow|add|deny|block|remove|rm|del|delete|help|--help|-h]"; }
+type ManagerResult = { action: "quit" } | { action: "add" } | { action: "edit"; rule: string; state: "allow" | "deny" } | { action: "delete"; rule: string; state: "allow" | "deny" };
+async function showManager(ctx: ExtensionCommandContext, store: Store): Promise<ManagerResult> {
+	return ctx.ui.custom<ManagerResult>((tui, theme, _kb, done) => {
+		const entries = [...store.whitelist.map((rule) => ({ rule, state: "allow" as const })), ...store.blacklist.map((rule) => ({ rule, state: "deny" as const }))].sort((a, b) => a.rule.localeCompare(b.rule));
+		let selected = 0; let help = false;
+		return { invalidate() {}, render(width: number) {
+			if (help) return ["/whitelist manager", "a add · e edit · d delete · ↑↓ select · Ctrl+C or q quit", "Esc returns to the list."].map((line) => truncateToWidth(line, width));
+			const lines = [theme.fg("accent", theme.bold("Command rules"))];
+			if (!entries.length) lines.push(theme.fg("muted", "No whitelist or blacklist rules configured."));
+			for (let i = 0; i < entries.length; i++) { const e = entries[i]!; const row = `${i === selected ? "› " : "  "}${e.state === "allow" ? "✅" : "❌"} | ${e.rule}`; lines.push(truncateToWidth(i === selected ? theme.bg("selectedBg", row) : row, width)); }
+			lines.push(theme.fg("dim", "↑↓ select · a add · e edit · d delete · h help · Ctrl+C quit")); return lines;
+		}, handleInput(data: string) {
+			if (help) { if (matchesKey(data, Key.escape)) { help = false; tui.requestRender(); } return; }
+			if (matchesKey(data, Key.ctrl("c")) || data === "q") return done({ action: "quit" });
+			if (data === "h") { help = true; tui.requestRender(); return; }
+			if (matchesKey(data, Key.up)) selected = Math.max(0, selected - 1); else if (matchesKey(data, Key.down)) selected = Math.min(Math.max(0, entries.length - 1), selected + 1); else if (data === "a") return done({ action: "add" }); else if (entries.length && data === "e") return done({ action: "edit", ...entries[selected]! }); else if (entries.length && data === "d") return done({ action: "delete", ...entries[selected]! }); tui.requestRender();
+		} };
+	});
 }
-
-function splitWords(segment: string): string[] | undefined {
-	const words: string[] = [];
-	let current = "";
-	let quote: "'" | '"' | undefined;
-	let escaped = false;
-
-	for (const char of segment) {
-		if (escaped) {
-			current += char;
-			escaped = false;
-			continue;
-		}
-		if (char === "\\" && quote !== "'") {
-			escaped = true;
-			continue;
-		}
-		if ((char === "'" || char === '"') && !quote) {
-			quote = char;
-			continue;
-		}
-		if (char === quote) {
-			quote = undefined;
-			continue;
-		}
-		if (!quote && /\s/.test(char)) {
-			if (current) words.push(current);
-			current = "";
-			continue;
-		}
-		current += char;
-	}
-
-	if (quote) return undefined;
-	if (current) words.push(current);
-	return words;
-}
-
-const READ_ONLY_BASH_COMMANDS = new Set([
-	"basename",
-	"cat",
-	"cd",
-	"cut",
-	"dirname",
-	"du",
-	"echo",
-	"egrep",
-	"false",
-	"fgrep",
-	"file",
-	"find",
-	"grep",
-	"head",
-	"less",
-	"ls",
-	"pwd",
-	"realpath",
-	"rg",
-	"sort",
-	"stat",
-	"tail",
-	"test",
-	"tr",
-	"tree",
-	"true",
-	"uniq",
-	"wc",
-]);
-
-const READ_ONLY_GIT_SUBCOMMANDS = new Set([
-	"blame",
-	"branch",
-	"diff",
-	"grep",
-	"log",
-	"ls-files",
-	"rev-parse",
-	"show",
-	"status",
-]);
-
-function getCommandName(words: string[]): { command: string; args: string[] } | undefined {
-	let index = 0;
-	while (index < words.length && /^[A-Za-z_][A-Za-z0-9_]*=.*/.test(words[index]!)) index++;
-	while (["command", "builtin", "time"].includes(words[index] ?? "")) index++;
-	if (words[index] === "env") {
-		index++;
-		while (index < words.length && (words[index]!.startsWith("-") || /^[A-Za-z_][A-Za-z0-9_]*=.*/.test(words[index]!))) index++;
-	}
-	if (!words[index]) return undefined;
-	return { command: words[index]!.split("/").pop()!, args: words.slice(index + 1) };
-}
-
-function getGitSubcommand(args: string[]): string | undefined {
-	let index = 0;
-	while (index < args.length) {
-		const arg = args[index]!;
-		if (arg === "-C" || arg === "-c") index += 2;
-		else if (arg.startsWith("--git-dir=") || arg.startsWith("--work-tree=")) index++;
-		else if (arg.startsWith("-")) index++;
-		else break;
-	}
-	return args[index];
-}
-
-function getXargsCommand(args: string[]): { command: string; args: string[] } | undefined {
-	let index = 0;
-	while (index < args.length) {
-		const arg = args[index]!;
-		if (["-0", "-r", "--no-run-if-empty", "-t", "-p"].includes(arg)) {
-			index++;
-			continue;
-		}
-		if (["-n", "-L", "-P", "-I", "-d", "-s", "-E", "--max-args", "--max-lines", "--max-procs", "--replace", "--delimiter", "--max-chars", "--eof"].includes(arg)) {
-			index += 2;
-			continue;
-		}
-		if (arg.startsWith("-")) {
-			index++;
-			continue;
-		}
-		return { command: arg.split("/").pop()!, args: args.slice(index + 1) };
-	}
-	return undefined;
-}
-
-function getBashCommandKey(command: string, args: string[]): string {
-	if (command === "git") {
-		const subcommand = getGitSubcommand(args);
-		return subcommand ? `git ${subcommand}` : "git";
-	}
-	if (command === "xargs") {
-		const xargsCommand = getXargsCommand(args);
-		return xargsCommand ? getBashCommandKey(xargsCommand.command, xargsCommand.args) : "xargs";
-	}
-	return command;
-}
-
-function isReadOnlyBashParsed(command: string, args: string[]): boolean {
-	if (command === "git") return READ_ONLY_GIT_SUBCOMMANDS.has(getGitSubcommand(args) ?? "");
-	if (command === "xargs") {
-		const xargsCommand = getXargsCommand(args);
-		return xargsCommand ? isReadOnlyBashParsed(xargsCommand.command, xargsCommand.args) : false;
-	}
-
-	if (!READ_ONLY_BASH_COMMANDS.has(command)) return false;
-	if (command === "find" && args.some((arg) => ["-delete", "-exec", "-execdir", "-ok", "-okdir"].includes(arg))) return false;
-	if (command === "sed" && args.some((arg) => arg === "-i" || arg.startsWith("-i") || arg === "--in-place" || arg.startsWith("--in-place="))) return false;
-	return true;
-}
-
-function isReadOnlyBashSegment(segment: string): boolean {
-	const words = splitWords(segment);
-	if (!words) return false;
-	const parsed = getCommandName(words);
-	if (!parsed) return true;
-	return isReadOnlyBashParsed(parsed.command, parsed.args);
-}
-
-function isReadOnlyBashCommand(input: unknown): boolean {
-	if (!input || typeof input !== "object") return false;
-	const command = (input as Record<string, unknown>).command;
-	if (typeof command !== "string" || command.trim().length === 0) return false;
-	if (hasWriteRedirection(command) || command.includes("`") || command.includes("$(")) return false;
-	const segments = splitShellSegments(command);
-	return !!segments?.length && segments.every(isReadOnlyBashSegment);
-}
-
-function isEditLikeTool(toolName: string): boolean {
-	return ["edit", "write"].includes(toolName);
-}
-
-function actionLabel(toolName: string, input: unknown, cwd: string): string {
-	if (toolName === "bash" && input && typeof input === "object") {
-		const command = (input as Record<string, unknown>).command;
-		if (typeof command === "string") return `bash: ${command}`;
-	}
-
-	const path = getPrimaryPath(cwd, toolName, input);
-	const pathText = path ? relative(cwd, path) || "." : undefined;
-	return pathText ? `${toolName}: ${pathText}` : `${toolName}: ${stableStringify(input)}`;
-}
-
-function getGlobalActionKey(toolName: string, input: unknown): string {
-	if (toolName !== "bash" || !input || typeof input !== "object") return `tool:${toolName}`;
-
-	const command = (input as Record<string, unknown>).command;
-	if (typeof command !== "string") return "bash";
-	const segments = splitShellSegments(command);
-	if (!segments?.length) return "bash";
-
-	const commandKeys = segments
-		.map((segment) => {
-			const words = splitWords(segment);
-			const parsed = words ? getCommandName(words) : undefined;
-			return parsed ? getBashCommandKey(parsed.command, parsed.args) : undefined;
-		})
-		.filter((value): value is string => !!value);
-
-	return commandKeys.length > 0 ? `bash:${commandKeys.join(" | ")}` : "bash";
-}
-
-function getWhitelistEntries(store: Store): WhitelistEntry[] {
-	return [
-		...store.actionKeys.map((value, index) => ({
-			type: "action" as const,
-			index,
-			label: `Action exacte: ${value}`,
-			value,
-		})),
-		...store.globalActionKeys.map((value, index) => ({
-			type: "globalAction" as const,
-			index,
-			label: `Commande globale: ${value}`,
-			value,
-		})),
-		...store.editDirectories.map((value, index) => ({
-
-			type: "editDirectory" as const,
-			index,
-			label: `Éditions dans le répertoire: ${value}`,
-			value,
-		})),
-	];
-}
-
-function deleteWhitelistEntry(store: Store, entry: WhitelistEntry): void {
-	if (entry.type === "action") store.actionKeys.splice(entry.index, 1);
-	else if (entry.type === "globalAction") store.globalActionKeys.splice(entry.index, 1);
-	else store.editDirectories.splice(entry.index, 1);
-}
-
-function updateWhitelistEntry(store: Store, entry: WhitelistEntry, nextValue: string): void {
-	if (entry.type === "action") store.actionKeys[entry.index] = nextValue;
-	else if (entry.type === "globalAction") store.globalActionKeys[entry.index] = nextValue;
-	else store.editDirectories[entry.index] = resolve(nextValue);
-}
-
-async function showWhitelistMenu(ctx: ExtensionCommandContext, store: Store): Promise<WhitelistMenuResult> {
-	const entries = getWhitelistEntries(store);
-	let selected = 0;
-
-	return ctx.ui.custom<WhitelistMenuResult>((tui, theme, _keybindings, done) => ({
-		handleInput(data: string): void {
-			if (matchesKey(data, Key.up)) {
-				selected = Math.max(0, selected - 1);
-				tui.requestRender();
-				return;
-			}
-			if (matchesKey(data, Key.down)) {
-				selected = Math.min(Math.max(0, entries.length - 1), selected + 1);
-				tui.requestRender();
-				return;
-			}
-			if (data === "q" || matchesKey(data, Key.escape)) {
-				done({ action: "quit" });
-				return;
-			}
-			if (entries.length === 0) return;
-			if (data === "d") {
-				done({ action: "delete", entry: entries[selected]! });
-				return;
-			}
-			if (data === "e") {
-				done({ action: "edit", entry: entries[selected]! });
-			}
-		},
-		render(width: number): string[] {
-			const innerWidth = Math.max(10, width - 2);
-			const lines: string[] = [];
-			const border = theme.fg("borderAccent", "─".repeat(innerWidth));
-			lines.push(border);
-			lines.push(truncateToWidth(theme.fg("accent", theme.bold("Whitelist courantes")), width));
-			lines.push(theme.fg("dim", `Stockées dans .pi/${STORE_FILE}`));
-			lines.push("");
-
-			if (entries.length === 0) {
-				lines.push(theme.fg("muted", "Aucune whitelist enregistrée."));
-			} else {
-				for (let i = 0; i < entries.length; i++) {
-					const entry = entries[i]!;
-					const prefix = i === selected ? "› " : "  ";
-					const text = `${prefix}${entry.label}`;
-					lines.push(truncateToWidth(i === selected ? theme.bg("selectedBg", theme.fg("accent", text)) : text, width));
-				}
-			}
-
-			lines.push("");
-			lines.push(theme.fg("dim", "↑/↓ se déplacer • d supprimer • e éditer • q quitter"));
-			lines.push(border);
-			return lines.map((line) => truncateToWidth(line, width));
-		},
-		invalidate(): void {},
-	}));
+async function list(ctx: ExtensionCommandContext, store: Store): Promise<void> { const rules = [...store.whitelist.map((r) => `✅ | ${r}`), ...store.blacklist.map((r) => `❌ | ${r}`)].sort(); ctx.ui.notify(rules.length ? rules.join("\n") : "No whitelist or blacklist rules configured.\nUse /whitelist help for help.", "info"); }
+async function chooseRuleState(ctx: ExtensionCommandContext, initial: "allow" | "deny"): Promise<"allow" | "deny" | undefined> {
+	return ctx.ui.custom((tui, theme, _kb, done) => { let state = initial; return { invalidate() {}, render(width: number) { return [theme.fg("accent", "Choose rule type"), `${state === "allow" ? "› " : "  "}✅ whitelist`, `${state === "deny" ? "› " : "  "}❌ blacklist`, theme.fg("dim", "Space toggle · Enter confirm · Esc cancel")].map((line) => truncateToWidth(line, width)); }, handleInput(data: string) { if (matchesKey(data, Key.escape)) return done(undefined); if (matchesKey(data, Key.space) || matchesKey(data, Key.up) || matchesKey(data, Key.down)) { state = state === "allow" ? "deny" : "allow"; tui.requestRender(); } else if (matchesKey(data, Key.enter)) done(state); } }; });
 }
 
 export default function (pi: ExtensionAPI) {
-	async function blockWithUserPrompt(ctx: ExtensionContext): Promise<{ block: true; reason: string }> {
-		const prompt = await ctx.ui.editor("Entrer un prompt à envoyer à l'assistant");
-		const trimmed = prompt?.trim();
-		if (trimmed) {
-			pi.sendUserMessage(trimmed, { deliverAs: "steer" });
-			return { block: true, reason: `${EXTENSION_NAME}: action bloquée, prompt utilisateur envoyé` };
-		}
-		return { block: true, reason: `${EXTENSION_NAME}: action bloquée, prompt utilisateur vide/annulé` };
-	}
-
-	pi.registerCommand("whitelist", {
-		description: "Lister, éditer et supprimer les whitelists de commands whitelist",
-		handler: async (_args, ctx) => {
-			if (!ctx.hasUI) {
-				ctx.ui.notify("/whitelist nécessite une UI interactive", "warning");
-				return;
-			}
-
-			const storePath = resolve(getPiDirectory(resolve(ctx.cwd)), STORE_FILE);
+	// Validate/migrate the project configuration as soon as a session starts, not only
+	// when the first protected tool is called.
+	pi.on("session_start", async (_event, ctx) => {
+		await loadStore(storePath(ctx.cwd));
+	});
+	pi.registerCommand("whitelist", { description: "List and edit command allow/deny rules", handler: async (args, ctx) => {
+		const [verb, ...rest] = args.trim().split(/\s+/); const path = storePath(ctx.cwd); const store = await loadStore(path);
+		if (!verb) {
+			if (ctx.mode !== "tui") { await list(ctx, store); return; }
 			while (true) {
-				const store = await loadStore(storePath);
-				const result = await showWhitelistMenu(ctx, store);
-
-				if (result.action === "quit") return;
-
-				if (result.action === "delete") {
-					deleteWhitelistEntry(store, result.entry);
-					await saveStore(storePath, store);
-					ctx.ui.notify("Whitelist supprimée", "info");
-					continue;
+				const current = await loadStore(path); const action = await showManager(ctx, current);
+				if (action.action === "quit") return;
+				if (action.action === "delete") {
+					if (action.state === "deny" && !(await ctx.ui.confirm("Delete blacklist rule?", `Delete ❌ ${action.rule}?`))) continue;
+					current[action.state === "allow" ? "whitelist" : "blacklist"] = current[action.state === "allow" ? "whitelist" : "blacklist"].filter((rule) => rule !== action.rule); await saveStore(path, current); continue;
 				}
-
-				const nextValue = await ctx.ui.editor("Modifier la whitelist", result.entry.value);
-				if (nextValue === undefined) continue;
-				const trimmed = nextValue.trim();
-				if (!trimmed) {
-					ctx.ui.notify("Valeur vide ignorée", "warning");
-					continue;
-				}
-				updateWhitelistEntry(store, result.entry, trimmed);
-				await saveStore(storePath, store);
-				ctx.ui.notify("Whitelist modifiée", "info");
+				const entered = await ctx.ui.editor(action.action === "add" ? "Add command rule" : "Edit command rule", action.action === "edit" ? action.rule : "");
+				if (entered === undefined) continue; const rule = normalizeRule(entered); if (!rule) { ctx.ui.notify("Invalid command rule.", "error"); continue; }
+				const state = await chooseRuleState(ctx, action.action === "edit" ? action.state : "allow"); if (!state) continue;
+				if (action.action === "edit" && action.rule !== rule) current[action.state === "allow" ? "whitelist" : "blacklist"] = current[action.state === "allow" ? "whitelist" : "blacklist"].filter((value) => value !== action.rule);
+				const own = state === "allow" ? current.whitelist : current.blacklist; const other = state === "allow" ? current.blacklist : current.whitelist;
+				if (other.includes(rule)) { ctx.ui.notify("Rule conflicts with the other list.", "error"); continue; } if (!own.includes(rule)) own.push(rule); await saveStore(path, current);
 			}
-		},
-	});
-
-	pi.on("tool_call", async (event, ctx) => {
-		const cwd = resolve(ctx.cwd);
-		const storePath = resolve(getPiDirectory(cwd), STORE_FILE);
-		const store = await loadStore(storePath);
-
-		// No permission needed for file reads, regardless of the tool/path.
-		if (isReadLikeTool(event.toolName) || (event.toolName === "bash" && isReadOnlyBashCommand(event.input))) {
-			return undefined;
 		}
-
-		const globalActionKey = getGlobalActionKey(event.toolName, event.input);
-		if (store.globalActionKeys.includes(globalActionKey)) return undefined;
-
-		// File edit/write whitelist is directory-based.
-		if (isEditLikeTool(event.toolName)) {
-			const rawPath = getPathInput(event.input);
-			const targetPath = normalizePath(cwd, rawPath);
-			const targetDir = targetPath ? dirname(targetPath) : cwd;
-			const whitelistedDirectory = store.editDirectories.find((dir) => isInsideOrEqual(dir, targetDir));
-			if (whitelistedDirectory) return undefined;
-
-			if (!ctx.hasUI) {
-				return { block: true, reason: `${EXTENSION_NAME}: édition bloquée (aucune UI pour confirmer)` };
-			}
-
-			const label = actionLabel(event.toolName, event.input, cwd);
-			const choice = await ctx.ui.select(`Confirmer l'action ?\n\n${label}`, [
-				`1/ oui, et whitelist les editions de fichier dans ce répertoire (${targetDir})`,
-				`2/ oui, et whitelist globalement cette commande (${globalActionKey})`,
-				"3/ oui, mais uniquement cette fois",
-				"4/ entrer un prompt pour l'assistant",
-				"5/ non",
-			]);
-
-			if (choice?.startsWith("1/")) {
-				store.editDirectories.push(targetDir);
-				await saveStore(storePath, store);
-				ctx.ui.notify(`${EXTENSION_NAME}: répertoire whitelisté: ${targetDir}`, "info");
-				return undefined;
-			}
-			if (choice?.startsWith("2/")) {
-				store.globalActionKeys.push(globalActionKey);
-				await saveStore(storePath, store);
-				ctx.ui.notify(`${EXTENSION_NAME}: commande whitelistée globalement`, "info");
-				return undefined;
-			}
-			if (choice?.startsWith("3/")) return undefined;
-			if (choice?.startsWith("4/")) return blockWithUserPrompt(ctx);
-			return { block: true, reason: `${EXTENSION_NAME}: refusé par l'utilisateur` };
-		}
-
-		const actionKey = `${event.toolName}:${stableStringify(event.input)}`;
-		if (store.actionKeys.includes(actionKey)) return undefined;
-
-		if (!ctx.hasUI) {
-			return { block: true, reason: `${EXTENSION_NAME}: action bloquée (aucune UI pour confirmer)` };
-		}
-
-		const label = actionLabel(event.toolName, event.input, cwd);
-		const choice = await ctx.ui.select(`Confirmer l'action ?\n\n${label}`, [
-			"1/ oui, et whitelist pour les prochaines fois",
-			`2/ oui, et whitelist globalement cette commande (${globalActionKey})`,
-			"3/ oui, mais uniquement cette fois",
-			"4/ entrer un prompt pour l'assistant",
-			"5/ non",
-		]);
-
-		if (choice?.startsWith("1/")) {
-			store.actionKeys.push(actionKey);
-			await saveStore(storePath, store);
-			ctx.ui.notify(`${EXTENSION_NAME}: action whitelistée`, "info");
-			return undefined;
-		}
-		if (choice?.startsWith("2/")) {
-			store.globalActionKeys.push(globalActionKey);
-			await saveStore(storePath, store);
-			ctx.ui.notify(`${EXTENSION_NAME}: commande whitelistée globalement`, "info");
-			return undefined;
-		}
-		if (choice?.startsWith("3/")) return undefined;
-		if (choice?.startsWith("4/")) return blockWithUserPrompt(ctx);
-
-		return { block: true, reason: `${EXTENSION_NAME}: refusé par l'utilisateur` };
-	});
+		if (["help", "--help", "-h"].includes(verb)) { ctx.ui.notify(helpText(), "info"); return; }
+		if (verb === "list") { await list(ctx, store); return; }
+		const isAllow = ["allow", "add"].includes(verb), isDeny = ["deny", "block"].includes(verb), isRemove = ["remove", "rm", "del", "delete"].includes(verb);
+		if (!isAllow && !isDeny && !isRemove) { ctx.ui.notify(`Unknown /whitelist command: ${verb}. Use /whitelist help.`, "error"); return; }
+		const rule = normalizeRule(rest.join(" ")); if (!rule) { ctx.ui.notify("A valid command rule is required. Use /whitelist --help.", "error"); return; }
+		if (isRemove) { const hasAllow = store.whitelist.includes(rule), hasDeny = store.blacklist.includes(rule); if (!hasAllow && !hasDeny) { ctx.ui.notify("Rule does not exist.", "error"); return; } if (hasDeny && !(await ctx.ui.confirm("Delete blacklist rule?", `Delete ❌ ${rule}?`))) return; store.whitelist = store.whitelist.filter((r) => r !== rule); store.blacklist = store.blacklist.filter((r) => r !== rule); await saveStore(path, store); return; }
+		const own = isAllow ? store.whitelist : store.blacklist; const other = isAllow ? store.blacklist : store.whitelist; if (other.includes(rule)) { ctx.ui.notify("Rule conflicts with the other list.", "error"); return; } if (!own.includes(rule)) own.push(rule); await saveStore(path, store);
+	} });
+	pi.on("tool_call", async (event, ctx) => { if (event.toolName === "bash") { const command = event.input && typeof event.input === "object" ? (event.input as { command?: unknown }).command : undefined; return typeof command === "string" ? gateBash(pi, ctx, command) : { block: true, reason: `${NAME}: invalid bash command` }; } if (event.toolName === "edit" || event.toolName === "write") return gateEdit(pi, ctx, event.toolName, event.input); return undefined; });
 }
