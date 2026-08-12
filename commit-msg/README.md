@@ -1,28 +1,28 @@
 # commit-msg
 
-Extension pi qui ajoute la commande :
+A Pi extension that adds the following command:
 
 ```text
 /gen-commit-msg
 ```
 
-Elle lit les changements git staged (`git diff --cached`) et demande à l'assistant de générer un message de commit en anglais. Une fois le résultat généré, elle propose de le copier dans le presse-papier.
+It reads staged Git changes (`git diff --cached`) and asks the assistant to generate an English commit message. Once the result is generated, it offers to copy it to the clipboard.
 
-Contraintes demandées à l'assistant :
+Assistant constraints:
 
-- maximum 5 lignes ;
-- la première ligne résume l'ensemble des changements ;
-- sortie limitée au message de commit, sans markdown ni explication.
+- at most 5 lines;
+- the first line summarizes all changes;
+- output is limited to the commit message, with no Markdown or explanation.
 
-## Utilisation
+## Usage
 
-Test ponctuel :
+Try it temporarily:
 
 ```bash
 pi -e ./commit-msg
 ```
 
-Installation projet avec auto-discovery :
+Install it in a project using auto-discovery:
 
 ```bash
 mkdir -p .pi/extensions
@@ -30,7 +30,7 @@ cp -R commit-msg .pi/extensions/
 pi
 ```
 
-Puis lancer :
+Then run:
 
 ```text
 /gen-commit-msg

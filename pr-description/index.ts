@@ -74,14 +74,14 @@ export default function (pi: ExtensionAPI) {
 		pendingPrDescription = false;
 		if (!ctx.hasUI) return;
 
-		const copy = await ctx.ui.confirm("Copier la description de PR ?", "Copier le markdown généré dans le presse-papier ?");
+		const copy = await ctx.ui.confirm("Copy PR description?", "Copy the generated Markdown to the clipboard?");
 		if (!copy) return;
 
 		try {
 			await copyToClipboard(text);
-			ctx.ui.notify("Description de PR copiée dans le presse-papier", "info");
+			ctx.ui.notify("PR description copied to the clipboard", "info");
 		} catch (error) {
-			ctx.ui.notify(`Impossible de copier dans le presse-papier: ${error instanceof Error ? error.message : String(error)}`, "error");
+			ctx.ui.notify(`Unable to copy to the clipboard: ${error instanceof Error ? error.message : String(error)}`, "error");
 		}
 	});
 

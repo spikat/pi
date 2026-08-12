@@ -1,45 +1,45 @@
 # review
 
-Extension pi qui ajoute la commande :
+A Pi extension that adds the following command:
 
 ```text
 /review
 ```
 
-Elle lance une code review de la branche actuelle en analysant :
+It runs a code review of the current branch by analyzing:
 
-- les commits de la branche courante par rapport à une branche de base détectée (`origin/HEAD`, `origin/main`, `origin/master`, `main`, puis `master`) ;
-- les changements staged ;
-- les changements non staged.
+- commits on the current branch compared with a detected base branch (`origin/HEAD`, `origin/main`, `origin/master`, `main`, then `master`);
+- staged changes;
+- unstaged changes.
 
-La review recherche notamment :
+The review looks for, among other things:
 
-- bugs et problèmes de correctness ;
-- régressions ou changements de comportement ;
-- problèmes de performance ;
-- risques sécurité / perte de données ;
-- maintenabilité, couverture de tests et autres remarques pertinentes.
+- bugs and correctness issues;
+- regressions or behavior changes;
+- performance problems;
+- security or data-loss risks;
+- maintainability, test coverage, and other relevant concerns.
 
-Les trouvailles sont demandées triées par criticité (`Critical`, `High`, `Medium`, `Low`, `Nit`) avec une recommandation de fix si possible.
+Findings are requested in severity order (`Critical`, `High`, `Medium`, `Low`, `Nit`), with a recommended fix where possible.
 
-Une fois la review générée, l'extension parcourt les trouvailles une par une :
+Once the review is generated, the extension processes findings one at a time:
 
-1. choix `yes` / `no` pour générer un correctif ciblé ;
-2. si `yes`, l'assistant génère/applique un fix pour ce problème uniquement ;
-3. après le fix, choix `ok` ou `prompt pour itérer` ;
-4. quand tu choisis `ok`, l'extension passe à la trouvaille suivante.
+1. choose `yes` or `no` to generate a targeted fix;
+2. if you choose `yes`, the assistant generates and applies a fix only for that finding;
+3. after the fix, choose `ok` or `iterate with a prompt`;
+4. when you choose `ok`, the extension moves to the next finding.
 
-Tu gardes donc la décision au cas par cas.
+You retain control over each decision.
 
-## Utilisation
+## Usage
 
-Test ponctuel :
+Try it temporarily:
 
 ```bash
 pi -e ./review
 ```
 
-Installation projet avec auto-discovery :
+Install it in a project using auto-discovery:
 
 ```bash
 mkdir -p .pi/extensions
@@ -47,7 +47,7 @@ cp -R review .pi/extensions/
 pi
 ```
 
-Puis lancer :
+Then run:
 
 ```text
 /review

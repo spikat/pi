@@ -123,17 +123,17 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		while (true) {
-			const choice = await ctx.ui.select(`Validation du correctif ${index + 1}/${findings.length}`, ["ok", "prompt pour itérer"]);
+			const choice = await ctx.ui.select(`Fix validation ${index + 1}/${findings.length}`, ["ok", "iterate with a prompt"]);
 			if (!choice || choice === "ok") {
 				await processNextFinding(ctx, findings, index + 1);
 				return;
 			}
 
-			if (choice === "prompt pour itérer") {
-				const prompt = await ctx.ui.editor("Prompt d'itération pour le correctif");
+			if (choice === "iterate with a prompt") {
+				const prompt = await ctx.ui.editor("Iteration prompt for the fix");
 				const trimmed = prompt?.trim();
 				if (!trimmed) {
-					ctx.ui.notify("Prompt vide/annulé", "warning");
+					ctx.ui.notify("Empty or cancelled prompt", "warning");
 					continue;
 				}
 

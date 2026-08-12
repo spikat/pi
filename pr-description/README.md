@@ -1,14 +1,14 @@
 # pr-description
 
-Extension pi qui ajoute la commande :
+A Pi extension that adds the following command:
 
 ```text
 /gen-pr-desc
 ```
 
-Elle regarde les commits de la branche courante par rapport à la branche de base détectée (`origin/HEAD`, `origin/main`, `origin/master`, `main`, puis `master`) et demande à l'assistant de générer une description de PR en markdown **en anglais**.
+It compares the current branch commits with a detected base branch (`origin/HEAD`, `origin/main`, `origin/master`, `main`, then `master`) and asks the assistant to generate an English Markdown pull request description.
 
-Template utilisé :
+The following template is used:
 
 ```markdown
 ### What does this PR do?
@@ -20,17 +20,17 @@ Template utilisé :
 ### Additional Notes
 ```
 
-Une fois la description générée, l'extension propose de copier le markdown dans le presse-papier.
+Once the description is generated, the extension offers to copy the Markdown to the clipboard.
 
-## Utilisation
+## Usage
 
-Test ponctuel :
+Try it temporarily:
 
 ```bash
 pi -e ./pr-description
 ```
 
-Installation projet avec auto-discovery :
+Install it in a project using auto-discovery:
 
 ```bash
 mkdir -p .pi/extensions
@@ -38,7 +38,7 @@ cp -R pr-description .pi/extensions/
 pi
 ```
 
-Puis lancer :
+Then run:
 
 ```text
 /gen-pr-desc

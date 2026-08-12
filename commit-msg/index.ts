@@ -54,14 +54,14 @@ export default function (pi: ExtensionAPI) {
 		pendingCommitMessage = false;
 		if (!ctx.hasUI) return;
 
-		const copy = await ctx.ui.confirm("Copier le message de commit ?", "Copier le contenu généré dans le presse-papier ?");
+		const copy = await ctx.ui.confirm("Copy commit message?", "Copy the generated content to the clipboard?");
 		if (!copy) return;
 
 		try {
 			await copyToClipboard(text);
-			ctx.ui.notify("Message de commit copié dans le presse-papier", "info");
+			ctx.ui.notify("Commit message copied to the clipboard", "info");
 		} catch (error) {
-			ctx.ui.notify(`Impossible de copier dans le presse-papier: ${error instanceof Error ? error.message : String(error)}`, "error");
+			ctx.ui.notify(`Unable to copy to the clipboard: ${error instanceof Error ? error.message : String(error)}`, "error");
 		}
 	});
 
