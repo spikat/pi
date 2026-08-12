@@ -134,7 +134,16 @@ function isPythonScript(words: string[]): boolean {
 
 function shellCContent(words: string[]): string | undefined {
 	const flag = words.indexOf("-c");
-	return flag >= 0 ? words[flag + 1] : undefined;
+	if (flag < 0) return undefined;
+	const content = words[flag + 1];
+	if (!content) return undefined;
+	const executable = words[0]?.split("/").at(-1) ?? "";
+	// Do not mistake ordinary command flags such as `wc -c file.html` for
+	// shell execution. Known shells always qualify; unknown/custom shells are
+	// accepted when their -c payload visibly contains shell program syntax.
+	const knownShell = /(?:^|[-_.])(ba|z|da|k|mk|tc)?sh$|^(?:bash|zsh|dash|fish|shell)$/i.test(executable);
+	const shellProgram = /[|;&(){}$`\n]/.test(content) || /\s/.test(content);
+	return knownShell || shellProgram ? content : undefined;
 }
 
 export function analyseShell(command: string): { parts: CommandPart[]; unsupported: boolean } {

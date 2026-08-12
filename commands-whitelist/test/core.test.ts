@@ -23,6 +23,15 @@ test("recurses through shell -c and process substitutions", () => {
   assert.deepEqual(process.parts.map((p) => p.displayWords.join(" ")), ["diff <(sort file1) <(sort file2) *", "sort file1 *", "sort file2 *"]);
 });
 
+test("does not mistake wc -c for a shell -c invocation", () => {
+  const result = analyseShell("git diff --check && wc -c comparatif.html && rg -n 'foo|bar' comparatif.html");
+  assert.deepEqual(result.parts.map((part) => part.displayWords.join(" ")), [
+    "git diff --check *",
+    "wc -c comparatif.html *",
+    "rg -n foo|bar comparatif.html *",
+  ]);
+});
+
 test("recurses through shell groups", () => {
   const result = analyseShell("{ cmd1; cmd2 && cmd3; }");
   assert.deepEqual(result.parts.map((p) => p.displayWords.join(" ")), ["cmd1 *", "cmd2 *", "cmd3 *"]);
