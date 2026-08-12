@@ -1,0 +1,35 @@
+{
+  "name": "@spikat/pi-commit-msg",
+  "version": "1.0.0",
+  "description": "Generate English commit messages from staged Git changes in Pi",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "git",
+    "commit"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/spikat/pi.git",
+    "directory": "commit-msg"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

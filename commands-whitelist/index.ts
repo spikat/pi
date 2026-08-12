@@ -27,7 +27,10 @@ class PromptLine {
 		if (matchesKey(data, Key.right)) { this.cursor = Math.min(this.text.length, this.cursor + 1); return true; }
 		if (matchesKey(data, Key.backspace)) { if (this.cursor) { this.text = this.text.slice(0, this.cursor - 1) + this.text.slice(this.cursor); this.cursor--; } return true; }
 		if (matchesKey(data, Key.delete)) { this.text = this.text.slice(0, this.cursor) + this.text.slice(this.cursor + 1); return true; }
-		if (data.length === 1 && data >= " ") { this.text = this.text.slice(0, this.cursor) + data + this.text.slice(this.cursor); this.cursor++; return true; }
+		// Terminal paste arrives as one multi-character input event, unlike normal
+		// typing. Keep this single-line input stable by folding pasted newlines.
+		const pasted = data.replace(/[\r\n]+/g, " ");
+		if (pasted.length > 0 && !/[\x00-\x1f\x7f]/.test(pasted)) { this.text = this.text.slice(0, this.cursor) + pasted + this.text.slice(this.cursor); this.cursor += pasted.length; return true; }
 		return false;
 	}
 	render(active: boolean): string { const before = this.text.slice(0, this.cursor); const at = this.text[this.cursor] ?? " "; const after = this.text.slice(this.cursor + 1); return `  Enter a prompt for the assistant: ${before}${active ? `\x1b[7m${at}\x1b[27m` : this.text || "[... ]"}${active ? after : ""}`; }
@@ -51,8 +54,9 @@ async function showGate(ctx: ExtensionContext, choices: Choice[], global?: strin
 		return { invalidate() {}, render, handleInput(data: string) {
 			if (help) { if (matchesKey(data, Key.escape)) { help = false; tui.requestRender(); } return; }
 			if (matchesKey(data, Key.ctrl("c"))) return done({ action: "block", reason: `${NAME}: cancelled by user` });
-			if (data === "h") { help = true; tui.requestRender(); return; }
+			// The prompt editor owns printable keys, including “h”.
 			if (selected === promptIndex) { if (matchesKey(data, Key.enter)) return done({ action: "prompt", prompt: prompt.text.trim() }); if (prompt.handle(data)) { tui.requestRender(); return; } }
+			if (data === "h") { help = true; tui.requestRender(); return; }
 			if (matchesKey(data, Key.up)) { selected = Math.max(0, selected - 1); tui.requestRender(); return; }
 			if (matchesKey(data, Key.down)) { selected = Math.min(promptIndex, selected + 1); tui.requestRender(); return; }
 			if (selected < choices.length) {

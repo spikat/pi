@@ -1,0 +1,35 @@
+{
+  "name": "@spikat/pi-pr-description",
+  "version": "1.0.0",
+  "description": "Generate Markdown pull request descriptions from Git branch commits in Pi",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "git",
+    "pull-request"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/spikat/pi.git",
+    "directory": "pr-description"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

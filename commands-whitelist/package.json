@@ -1,14 +1,42 @@
 {
-  "name": "commands-whitelist",
-  "private": true,
+  "name": "@spikat/pi-commands-whitelist",
+  "version": "1.0.0",
+  "description": "Review shell commands and file edits before Pi executes them",
+  "license": "MIT",
   "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "security",
+    "command-whitelist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/spikat/pi.git",
+    "directory": "commands-whitelist"
+  },
+  "files": [
+    "index.ts",
+    "core.ts",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "test": "tsx --test test/**/*.test.ts",
     "check": "tsc --noEmit"
   },
-  "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.84.1",
-    "@earendil-works/pi-tui": "^0.84.1"
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",
