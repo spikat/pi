@@ -64,8 +64,54 @@ function stripRedirections(source: string): string {
 	return out;
 }
 
+function hereDocumentDelimiter(line: string): { delimiter: string; stripTabs: boolean } | undefined {
+	let quote: "'" | '"' | undefined;
+	let escaped = false;
+	for (let i = 0; i < line.length - 1; i++) {
+		const char = line[i]!;
+		if (escaped) { escaped = false; continue; }
+		if (char === "\\" && quote !== "'") { escaped = true; continue; }
+		if ((char === "'" || char === '"') && !quote) { quote = char; continue; }
+		if (char === quote) { quote = undefined; continue; }
+		if (quote || char !== "<" || line[i + 1] !== "<" || line[i + 2] === "<") continue;
+		let cursor = i + 2;
+		const stripTabs = line[cursor] === "-";
+		if (stripTabs) cursor++;
+		while (/\s/.test(line[cursor] ?? "")) cursor++;
+		if (!line[cursor]) return undefined;
+		const quoted = line[cursor] === "'" || line[cursor] === '"' ? line[cursor++] : undefined;
+		let delimiter = "";
+		while (cursor < line.length && (quoted ? line[cursor] !== quoted : !/\s|[|;&(){}]/.test(line[cursor]!))) delimiter += line[cursor++]!;
+		return delimiter ? { delimiter, stripTabs } : undefined;
+	}
+	return undefined;
+}
+
+/** Remove here-document bodies so their data cannot become fake shell commands. */
+function removeHereDocumentBodies(command: string): string | undefined {
+	const lines = command.split("\n");
+	const output: string[] = [];
+	for (let index = 0; index < lines.length; index++) {
+		const line = lines[index]!;
+		output.push(line);
+		const hereDoc = hereDocumentDelimiter(line);
+		if (!hereDoc) continue;
+		let found = false;
+		while (++index < lines.length) {
+			const candidate = hereDoc.stripTabs ? lines[index]!.replace(/^\t+/, "") : lines[index]!;
+			if (candidate === hereDoc.delimiter) { found = true; break; }
+			output.push("");
+		}
+		if (!found) return undefined;
+	}
+	return output.join("\n");
+}
+
 /** Splits shell lists while respecting quotes, escaped separators and nested $(...) / <(...). */
 export function splitShellLists(command: string): string[] | undefined {
+	const withoutHereDocBodies = removeHereDocumentBodies(command);
+	if (withoutHereDocBodies === undefined) return undefined;
+	command = withoutHereDocBodies;
 	const parts: string[] = [];
 	let current = "";
 	let quote: "'" | '"' | undefined;

@@ -32,6 +32,28 @@ test("does not mistake wc -c for a shell -c invocation", () => {
   ]);
 });
 
+test("does not treat here-document bodies as shell commands", () => {
+  const result = analyseShell(`mkdir -p web/test && cat > web/package.json <<'EOF'
+{
+  "name": "@spikat/pi-web",
+  "scripts": { "test": "tsx --test test/**/*.test.ts" }
+}
+EOF
+cat > web/tsconfig.json <<'EOF'
+{ "compilerOptions": { "target": "ES2022" } }
+EOF
+cp LICENSE web/LICENSE
+cd web && npm install --package-lock-only`);
+  assert.deepEqual(result.parts.map((part) => part.displayWords.join(" ")), [
+    "mkdir -p web/test *",
+    "cat *",
+    "cat *",
+    "cp LICENSE web/LICENSE *",
+    "cd web *",
+    "npm install --package-lock-only *",
+  ]);
+});
+
 test("recurses through shell groups", () => {
   const result = analyseShell("{ cmd1; cmd2 && cmd3; }");
   assert.deepEqual(result.parts.map((p) => p.displayWords.join(" ")), ["cmd1 *", "cmd2 *", "cmd3 *"]);
