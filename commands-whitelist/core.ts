@@ -29,7 +29,7 @@ export function shellWords(source: string): { words: string[]; dynamic: boolean 
 		if (c === "\\" && quote !== "'") { escaped = true; continue; }
 		if ((c === "'" || c === '"') && !quote) { quote = c; continue; }
 		if (c === quote) { quote = undefined; continue; }
-		if (!quote && c === "(" && source[i - 1] === "$") { substitutionDepth++; current += c; continue; }
+		if (!quote && c === "(" && (source[i - 1] === "$" || source[i - 1] === "<")) { substitutionDepth++; current += c; continue; }
 		if (!quote && c === ")" && substitutionDepth > 0) { substitutionDepth--; current += c; continue; }
 		if (!quote && substitutionDepth === 0 && /\s/.test(c)) { if (current) { words.push(current); current = ""; } continue; }
 		if (c === "$" && source[i + 1] !== "(" && source[i + 1] !== "{") dynamic = true;

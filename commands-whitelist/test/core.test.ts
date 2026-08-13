@@ -32,6 +32,19 @@ test("does not mistake wc -c for a shell -c invocation", () => {
   ]);
 });
 
+test("keeps process substitutions as arguments while analyzing their contents", () => {
+  const result = analyseShell("probe=$(comm -13 <(printf '%s\\n' $oldpids | sort -n) <(pgrep -x xclip | sort -n) | tail -1)");
+  assert.deepEqual(result.parts.map((part) => part.displayWords.join(" ")), [
+    "comm -13 *",
+    "printf %s\\n *",
+    "sort -n *",
+    "pgrep -x xclip *",
+    "sort -n *",
+    "tail -1 *",
+  ]);
+  assert.equal(result.parts.some((part) => part.displayWords[0]?.startsWith("<(")), false);
+});
+
 test("normalizes bracket conditions instead of exposing a [ command", () => {
   const result = analyseShell(`echo "clipboard-image matches published package: $([ "$result" = 0 ] && echo yes || echo no)"`);
   assert.deepEqual(result.parts.map((part) => part.displayWords.join(" ")), [
