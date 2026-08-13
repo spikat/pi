@@ -40,7 +40,7 @@ export type WebBridge = {
 	onSync(handler: () => void): void;
 };
 
-type Pending = { resolve(value: unknown): void };
+type Pending = { dialog: WebDialog; resolve(value: unknown): void };
 
 /** Agent-side WebSocket client. It deliberately talks only to the local bridge. */
 export class LocalWebBridge implements WebBridge {
@@ -91,10 +91,13 @@ export class LocalWebBridge implements WebBridge {
 		const promise = new Promise<T>((resolve) => { settle = resolve; });
 		const resolve = (value: T) => {
 			if (!this.#pending.delete(id)) return;
-			settle(value); this.#send({ type: "dialog_close", id, value });
+			settle(value); this.#sendWhenOpen({ type: "dialog_close", id, value });
 		};
-		this.#pending.set(id, { resolve: (value) => resolve(value as T) });
-		this.#send({ type: "dialog_open", dialog: { id, ...dialog } });
+		const pending = { id, ...dialog };
+		this.#pending.set(id, { dialog: pending, resolve: (value) => resolve(value as T) });
+		// Pending dialogs are replayed after every agent hello instead of competing with
+		// discardable activity in the bounded outbox.
+		this.#sendDialogOpen(pending);
 		return { id, promise, resolve };
 	}
 
@@ -114,7 +117,8 @@ export class LocalWebBridge implements WebBridge {
 		const socket = new WebSocket(`wss://127.0.0.1:${state.port}/ws`, { rejectUnauthorized: false, headers: { "x-pi-web-agent-token": state.agentToken } });
 		this.#socket = socket;
 		socket.on("open", () => {
-			this.#send({ type: "agent_hello", metadata: this.#metadata });
+			socket.send(JSON.stringify({ type: "agent_hello", metadata: this.#metadata }));
+			for (const pending of this.#pending.values()) socket.send(JSON.stringify({ type: "dialog_open", dialog: pending.dialog }));
 			for (const event of this.#outbox.splice(0)) socket.send(event);
 		});
 		socket.on("message", (data) => this.#receive(String(data)));
@@ -126,9 +130,17 @@ export class LocalWebBridge implements WebBridge {
 		if (!this.#wanted || this.#reconnectTimer) return;
 		this.#reconnectTimer = setTimeout(async () => {
 			this.#reconnectTimer = undefined;
-			try { this.#state = await ensureBridge(); this.#open(); } catch { this.#retry(); }
+			try { this.#state = await ensureBridge(this.#state?.port); this.#open(); } catch { this.#retry(); }
 		}, 750);
 	}
+
+	#sendWhenOpen(value: unknown): boolean {
+		if (this.#socket?.readyState !== WebSocket.OPEN) return false;
+		this.#socket.send(JSON.stringify(value));
+		return true;
+	}
+
+	#sendDialogOpen(dialog: WebDialog): void { this.#sendWhenOpen({ type: "dialog_open", dialog }); }
 
 	#send(value: unknown): void {
 		const serialized = JSON.stringify(value);
