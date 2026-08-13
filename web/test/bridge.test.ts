@@ -7,7 +7,7 @@ import { join } from "node:path";
 import test from "node:test";
 import WebSocket from "ws";
 import { LocalWebBridge } from "../bridge.js";
-import { readBridgeState, type BridgeState } from "../runtime.js";
+import { bridgeIsHealthy, readBridgeState, type BridgeState } from "../runtime.js";
 
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 async function freePort(): Promise<number> {
@@ -50,6 +50,19 @@ function waitForDialog(socket: WebSocket, agentId: string, dialogId: string): Pr
 		socket.on("message", receive);
 	});
 }
+function waitForConnectedAgent(socket: WebSocket, agentId: string): Promise<void> {
+	return new Promise((resolve, reject) => {
+		let joined = false;
+		const done = () => { clearTimeout(timeout); socket.off("message", receive); resolve(); };
+		const receive = (raw: WebSocket.RawData) => {
+			const data = JSON.parse(String(raw)) as { type?: string; agentId?: string; agent?: { id?: string }; agents?: Array<{ id?: string }> };
+			if (data.type === "agent_leave" && data.agentId === agentId) { clearTimeout(timeout); socket.off("message", receive); reject(new Error("agent disconnected after reconnect")); return; }
+			if ((data.type === "agent_join" && data.agent?.id === agentId) || (data.type === "snapshot" && data.agents?.some((agent) => agent.id === agentId))) joined = true;
+		};
+		const timeout = setTimeout(() => { socket.off("message", receive); joined ? done() : reject(new Error("timed out waiting for agent reconnect")); }, 300);
+		socket.on("message", receive);
+	});
+}
 function stop(state: BridgeState | undefined): void { if (state) try { process.kill(state.pid, "SIGTERM"); } catch {} }
 
 test("replays pending dialogs after the bridge restarts", async () => {
@@ -72,6 +85,60 @@ test("replays pending dialogs after the bridge restarts", async () => {
 		await waitForDialog(browser, "replay-agent", decision.id);
 		browser.send(JSON.stringify({ type: "dialog_response", agentId: "replay-agent", id: decision.id, value: true }));
 		assert.equal(await decision.promise, true);
+	} finally {
+		browser?.close(); bridge?.disconnect(); stop(await readBridgeState(runtime));
+		if (originalRuntime === undefined) delete process.env.XDG_RUNTIME_DIR; else process.env.XDG_RUNTIME_DIR = originalRuntime;
+		await rm(runtimeParent, { recursive: true, force: true });
+	}
+});
+
+test("clears active state after an unavailable requested bridge", async () => {
+	const runtimeParent = await mkdtemp(join(tmpdir(), "pi-web-")); const runtime = join(runtimeParent, "pi-web"); const port = await freePort(); const conflictingPort = await freePort();
+	const originalRuntime = process.env.XDG_RUNTIME_DIR;
+	process.env.XDG_RUNTIME_DIR = runtimeParent;
+	let connected: LocalWebBridge | undefined; let failed: LocalWebBridge | undefined; let browser: WebSocket | undefined;
+	try {
+		connected = new LocalWebBridge();
+		await connected.connect({ id: "connected-agent", cwd: runtimeParent, commands: [], history: [] }, port, true);
+		const state = await eventually(() => readBridgeState(runtime));
+		browser = await openBrowser(state);
+		await waitForConnectedAgent(browser, "connected-agent");
+		let duplicateJoin = false;
+		const receive = (raw: WebSocket.RawData) => { const data = JSON.parse(String(raw)) as { type?: string; agent?: { id?: string } }; if (data.type === "agent_join" && data.agent?.id === "connected-agent") duplicateJoin = true; };
+		browser.on("message", receive);
+		await connected.connect({ id: "connected-agent", cwd: runtimeParent, name: "Updated agent", commands: [], history: [] }, port, true);
+		await wait(100);
+		browser.off("message", receive);
+		assert.equal(duplicateJoin, false);
+		failed = new LocalWebBridge();
+		await assert.rejects(failed.connect({ id: "failed-agent", cwd: runtimeParent, commands: [], history: [] }, conflictingPort, true), /bridge already runs on port/);
+		assert.equal(failed.active, false);
+		assert.equal(failed.openDecision({ kind: "confirm", title: "Unavailable bridge" }), undefined);
+	} finally {
+		browser?.close(); failed?.disconnect(); connected?.disconnect(); stop(await readBridgeState(runtime));
+		if (originalRuntime === undefined) delete process.env.XDG_RUNTIME_DIR; else process.env.XDG_RUNTIME_DIR = originalRuntime;
+		await rm(runtimeParent, { recursive: true, force: true });
+	}
+});
+
+test("does not replay an offline goodbye when re-enabled", async () => {
+	const runtimeParent = await mkdtemp(join(tmpdir(), "pi-web-")); const runtime = join(runtimeParent, "pi-web"); const port = await freePort();
+	const originalRuntime = process.env.XDG_RUNTIME_DIR;
+	process.env.XDG_RUNTIME_DIR = runtimeParent;
+	let bridge: LocalWebBridge | undefined; let browser: WebSocket | undefined; let state: BridgeState | undefined;
+	const metadata = { id: "offline-agent", cwd: runtimeParent, commands: [], history: [] };
+	try {
+		bridge = new LocalWebBridge();
+		await bridge.connect(metadata, port, true);
+		state = await eventually(() => readBridgeState(runtime));
+		stop(state);
+		await eventually(async () => !(await bridgeIsHealthy(state!)) ? true : undefined);
+		await wait(50);
+		bridge.disconnect();
+		await bridge.connect(metadata, port, true);
+		state = await eventually(async () => { const next = await readBridgeState(runtime); return next && next.pid !== state?.pid ? next : undefined; });
+		browser = await openBrowser(state);
+		await waitForConnectedAgent(browser, "offline-agent");
 	} finally {
 		browser?.close(); bridge?.disconnect(); stop(await readBridgeState(runtime));
 		if (originalRuntime === undefined) delete process.env.XDG_RUNTIME_DIR; else process.env.XDG_RUNTIME_DIR = originalRuntime;

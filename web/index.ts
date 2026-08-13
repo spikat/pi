@@ -132,7 +132,10 @@ export default function (pi: ExtensionAPI) {
 					const state = await readBridgeState();
 					ctx.ui.notify(`Open https://localhost:${state?.port ?? DEFAULT_PORT}/?token=${state?.browserToken ?? "unavailable"}`, "info");
 					bridge.emit("status", { message: "Agent connected to Pi Web" });
-				} catch (error) { ctx.ui.notify(`Unable to start Pi Web: ${error instanceof Error ? error.message : String(error)}`, "error"); }
+				} catch (error) {
+					if (!bridge.active) { enabled = false; pendingInputs.length = 0; pendingInputChars = 0; }
+					ctx.ui.notify(`Unable to start Pi Web: ${error instanceof Error ? error.message : String(error)}`, "error");
+				}
 				return;
 			}
 			if (command === "off") { enabled = false; pendingInputs.length = 0; pendingInputChars = 0; bridge.disconnect(); ctx.ui.notify("This Pi session disconnected from the web dashboard", "info"); return; }

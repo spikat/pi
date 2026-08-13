@@ -62,20 +62,46 @@ export class LocalWebBridge implements WebBridge {
 	get active(): boolean { return this.#wanted; }
 
 	async connect(metadata: AgentMetadata, port?: number, requirePort = false): Promise<void> {
+		const current = this.#socket;
+		if (this.#wanted && current && (current.readyState === WebSocket.OPEN || current.readyState === WebSocket.CONNECTING)) {
+			if (requirePort && this.#state && this.#state.port !== port) throw new Error(`web: bridge already runs on port ${this.#state.port}; use /web on or stop every connected agent first`);
+			this.#metadata = metadata;
+			if (current.readyState === WebSocket.OPEN) this.#send({ type: "agent_update", metadata });
+			return;
+		}
+		if (this.#reconnectTimer) clearTimeout(this.#reconnectTimer);
+		this.#reconnectTimer = undefined;
+		this.#socket?.close(); this.#socket = undefined;
 		this.#wanted = true;
 		this.#metadata = metadata;
-		this.#state = await ensureBridge(port, requirePort);
-		this.#open();
+		try {
+			this.#state = await ensureBridge(port, requirePort);
+			if (this.#wanted) this.#open();
+		} catch (error) {
+			const socket = this.#resetConnection();
+			socket?.close();
+			throw error;
+		}
 	}
 
 	disconnect(): void {
+		const socket = this.#resetConnection();
+		if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "agent_bye" }));
+		socket?.close();
+	}
+
+	#resetConnection(): WebSocket | undefined {
 		this.#wanted = false;
 		if (this.#reconnectTimer) clearTimeout(this.#reconnectTimer);
 		this.#reconnectTimer = undefined;
-		this.#send({ type: "agent_bye" });
-		this.#socket?.close(); this.#socket = undefined;
+		const socket = this.#socket;
+		this.#socket = undefined;
+		this.#state = undefined;
+		this.#metadata = undefined;
+		this.#outbox = [];
 		for (const pending of this.#pending.values()) pending.resolve(undefined);
 		this.#pending.clear();
+		return socket;
 	}
 
 	update(metadata: Partial<AgentMetadata>): void {
@@ -116,16 +142,22 @@ export class LocalWebBridge implements WebBridge {
 	onSync(handler: () => void): void { this.#syncHandler = handler; }
 
 	#open(): void {
-		const state = this.#state; if (!state || !this.#wanted) return;
+		const state = this.#state;
+		if (!state || !this.#wanted || this.#socket?.readyState === WebSocket.OPEN || this.#socket?.readyState === WebSocket.CONNECTING) return;
 		const socket = new WebSocket(`wss://127.0.0.1:${state.port}/ws`, { rejectUnauthorized: false, headers: { "x-pi-web-agent-token": state.agentToken } });
 		this.#socket = socket;
 		socket.on("open", () => {
+			if (!this.#wanted || this.#socket !== socket) { socket.close(); return; }
 			socket.send(JSON.stringify({ type: "agent_hello", metadata: this.#metadata }));
 			for (const pending of this.#pending.values()) socket.send(JSON.stringify({ type: "dialog_open", dialog: pending.dialog }));
 			for (const event of this.#outbox.splice(0)) socket.send(event);
 		});
 		socket.on("message", (data) => this.#receive(String(data)));
-		socket.on("close", () => this.#retry());
+		socket.on("close", () => {
+			if (this.#socket !== socket) return;
+			this.#socket = undefined;
+			this.#retry();
+		});
 		socket.on("error", () => undefined);
 	}
 
@@ -133,7 +165,12 @@ export class LocalWebBridge implements WebBridge {
 		if (!this.#wanted || this.#reconnectTimer) return;
 		this.#reconnectTimer = setTimeout(async () => {
 			this.#reconnectTimer = undefined;
-			try { this.#state = await ensureBridge(this.#state?.port); this.#open(); } catch { this.#retry(); }
+			try {
+				const state = await ensureBridge(this.#state?.port);
+				if (!this.#wanted) return;
+				this.#state = state;
+				this.#open();
+			} catch { this.#retry(); }
 		}, 750);
 	}
 
