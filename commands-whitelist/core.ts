@@ -169,7 +169,10 @@ function nestedExpressions(source: string): string[] | undefined {
 function ruleWords(words: string[], dynamic: boolean): string[] {
 	let index = 0;
 	while (SHELL_ASSIGNMENT.test(words[index] ?? "")) index++;
-	const kept = words.slice(index).map(normalizeWord);
+	let kept = words.slice(index).map(normalizeWord);
+	// `[` is the POSIX spelling of the `test` builtin. Normalize it into a
+	// meaningful command rule rather than exposing an invalid-looking `[ *`.
+	if (kept[0] === "[") kept = ["test", ...kept.slice(1, kept.at(-1) === "]" ? -1 : undefined)];
 	if (!kept.length) return [];
 	const dynamicIndex = dynamic ? kept.findIndex((word) => word.includes("$")) : -1;
 	// The command itself must always remain visible. A dynamic executable such as

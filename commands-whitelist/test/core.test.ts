@@ -32,6 +32,17 @@ test("does not mistake wc -c for a shell -c invocation", () => {
   ]);
 });
 
+test("normalizes bracket conditions instead of exposing a [ command", () => {
+  const result = analyseShell(`echo "clipboard-image matches published package: $([ "$result" = 0 ] && echo yes || echo no)"`);
+  assert.deepEqual(result.parts.map((part) => part.displayWords.join(" ")), [
+    "echo *",
+    "test *",
+    "echo yes *",
+    "echo no *",
+  ]);
+  assert.equal(result.parts.some((part) => part.displayWords[0] === "["), false);
+});
+
 test("does not reduce a dynamic executable to a fake wildcard command", () => {
   const result = analyseShell(`set -euo pipefail
 work=$(mktemp -d)
