@@ -9,6 +9,10 @@ const NAME = "commands whitelist";
 const FILE = "commands-whitelist.json";
 type Choice = { part: CommandPart; state: RuleState; args: number; persisted?: string };
 type GateResult = { action: "allow" } | { action: "block"; reason: string } | { action: "prompt"; prompt: string };
+type WebDecision<T> = { promise: Promise<T>; resolve(value: T): void };
+type WebBridge = { active: boolean; openDecision<T>(dialog: { kind: "confirm" | "select" | "input" | "command"; title: string; detail?: string; options?: string[]; initial?: string; data?: Record<string, unknown> }): WebDecision<T> | undefined };
+const WEB_BRIDGE_SYMBOL = Symbol.for("spikat.pi.web.bridge");
+function webBridge(): WebBridge | undefined { return (globalThis as Record<symbol, unknown>)[WEB_BRIDGE_SYMBOL] as WebBridge | undefined; }
 const sessionEditDirectories = new Set<string>();
 const sessionEditFiles = new Set<string>();
 
@@ -36,10 +40,39 @@ class PromptLine {
 	render(active: boolean): string { const before = this.text.slice(0, this.cursor); const at = this.text[this.cursor] ?? " "; const after = this.text.slice(this.cursor + 1); return `  Enter a prompt for the assistant: ${before}${active ? `\x1b[7m${at}\x1b[27m` : this.text || "[... ]"}${active ? after : ""}`; }
 }
 
+type BrowserGateChoice = { state: RuleState; args: number };
+type BrowserGateResult = { action: "validate"; choices: BrowserGateChoice[] } | { action: "prompt"; prompt: string } | { action: "block" };
+function webGateResult(answer: GateResult, choices: Choice[]): BrowserGateResult {
+	if (answer.action === "prompt") return { action: "prompt", prompt: answer.prompt };
+	if (answer.action === "block") return { action: "block" };
+	return { action: "validate", choices: choices.map((choice) => ({ state: choice.state, args: choice.args })) };
+}
+
 async function showGate(ctx: ExtensionContext, choices: Choice[], global?: string): Promise<GateResult> {
-	if (ctx.mode !== "tui") return { action: "block", reason: `${NAME}: no interactive UI is available` };
-	return ctx.ui.custom<GateResult>((tui, theme, _kb, done) => {
-		let selected = 0; let help = false; const prompt = new PromptLine(); const validateIndex = choices.length; const promptIndex = choices.length + 1;
+	const remote = webBridge()?.openDecision<unknown>({
+		kind: "command", title: "Review shell command", detail: global,
+		data: { choices: choices.map((choice) => ({ original: choice.part.original, displayWords: choice.part.displayWords, state: choice.state, args: choice.args, maxArgs: Math.max(0, choice.part.displayWords.filter((word) => word !== "*").length - 1), pythonScript: !!choice.part.pythonScript })), help: detailedHelp() },
+	});
+	const remoteResult = async (): Promise<GateResult> => {
+		const result = await remote!.promise;
+		if (!result || typeof result !== "object") return { action: "block", reason: `${NAME}: invalid Pi Web decision` };
+		const value = result as Partial<BrowserGateResult>;
+		if (value.action === "prompt" && typeof value.prompt === "string") return { action: "prompt", prompt: value.prompt.trim() };
+		if (value.action !== "validate" || !Array.isArray(value.choices) || value.choices.length !== choices.length) return { action: "block", reason: `${NAME}: command denied from Pi Web` };
+		for (let index = 0; index < choices.length; index++) {
+			const choice = choices[index]!; const submitted = value.choices[index];
+			if (!submitted || !["undecided", "allow", "deny"].includes(submitted.state)) return { action: "block", reason: `${NAME}: invalid Pi Web command selection` };
+			choice.state = choice.part.pythonScript && submitted.state === "allow" ? "undecided" : submitted.state;
+			const maxArgs = Math.max(0, choice.part.displayWords.filter((word) => word !== "*").length - 1);
+			choice.args = Number.isInteger(submitted.args) ? Math.min(maxArgs, Math.max(0, submitted.args)) : choice.args;
+		}
+		return { action: "allow" };
+	};
+	if (ctx.mode !== "tui") return remote ? remoteResult() : { action: "block", reason: `${NAME}: no interactive UI is available` };
+	return new Promise<GateResult>((resolve) => ctx.ui.custom<GateResult>((tui, theme, _kb, done) => {
+		let selected = 0; let help = false; let settled = false; const prompt = new PromptLine(); const validateIndex = choices.length; const promptIndex = choices.length + 1;
+		const finish = (answer: GateResult) => { if (settled) return; settled = true; remote?.resolve(webGateResult(answer, choices)); done(answer); resolve(answer); };
+		if (remote) remoteResult().then(finish).catch(() => undefined);
 		const render = (width: number): string[] => {
 			if (help) return detailedHelp().map((line) => truncateToWidth(line, width));
 			const lines = [theme.fg("accent", theme.bold("Review shell command"))];
@@ -53,26 +86,23 @@ async function showGate(ctx: ExtensionContext, choices: Choice[], global?: strin
 		};
 		return { invalidate() {}, render, handleInput(data: string) {
 			if (help) { if (matchesKey(data, Key.escape)) { help = false; tui.requestRender(); } return; }
-			if (matchesKey(data, Key.ctrl("c"))) return done({ action: "block", reason: `${NAME}: cancelled by user` });
-			// The prompt editor owns printable keys, including “h”.
-			if (selected === promptIndex) { if (matchesKey(data, Key.enter)) return done({ action: "prompt", prompt: prompt.text.trim() }); if (prompt.handle(data)) { tui.requestRender(); return; } }
+			if (matchesKey(data, Key.ctrl("c"))) return finish({ action: "block", reason: `${NAME}: cancelled by user` });
+			if (selected === promptIndex) { if (matchesKey(data, Key.enter)) return finish({ action: "prompt", prompt: prompt.text.trim() }); if (prompt.handle(data)) { tui.requestRender(); return; } }
 			if (data === "h") { help = true; tui.requestRender(); return; }
 			if (matchesKey(data, Key.up)) { selected = Math.max(0, selected - 1); tui.requestRender(); return; }
 			if (matchesKey(data, Key.down)) { selected = Math.min(promptIndex, selected + 1); tui.requestRender(); return; }
 			if (selected < choices.length) {
 				const choice = choices[selected]!;
-				if (choice.part.pythonScript) {
-					// Python script execution is opaque: it can only be allowed once or denied.
-					if (matchesKey(data, Key.space)) choice.state = choice.state === "deny" ? "undecided" : "deny";
-				} else if (matchesKey(data, Key.left)) choice.args = Math.max(0, choice.args - 1);
-				else if (matchesKey(data, Key.right)) choice.args = Math.min(choice.part.displayWords.filter((w) => w !== "*").length - 1, choice.args + 1);
+				if (choice.part.pythonScript) { if (matchesKey(data, Key.space)) choice.state = choice.state === "deny" ? "undecided" : "deny"; }
+				else if (matchesKey(data, Key.left)) choice.args = Math.max(0, choice.args - 1);
+				else if (matchesKey(data, Key.right)) choice.args = Math.min(choice.part.displayWords.filter((word) => word !== "*").length - 1, choice.args + 1);
 				else if (matchesKey(data, Key.space)) choice.state = choice.state === "undecided" ? "allow" : choice.state === "allow" ? "deny" : "undecided";
 				if (matchesKey(data, Key.enter)) selected = Math.min(promptIndex, selected + 1);
 				tui.requestRender(); return;
 			}
-			if (selected === validateIndex && matchesKey(data, Key.enter)) done({ action: "allow" });
+			if (selected === validateIndex && matchesKey(data, Key.enter)) finish({ action: "allow" });
 		} };
-	});
+	}));
 }
 
 async function gateBash(pi: ExtensionAPI, ctx: ExtensionContext, command: string): Promise<{ block: true; reason: string } | undefined> {
@@ -112,9 +142,35 @@ async function gateBash(pi: ExtensionAPI, ctx: ExtensionContext, command: string
 	return undefined;
 }
 
-async function showEditGate(ctx: ExtensionContext, title: string): Promise<{ choice: 1 | 2 | 3 | 4; persistent: boolean } | undefined> {
-	if (ctx.mode !== "tui") return undefined;
-	return ctx.ui.custom((tui, theme, _kb, done) => { let selected = 0; const persistent = [false, false]; const labels = ["1. Allow a directory", "2. Allow this file", "3. Deny", "4. Enter a prompt for the assistant"]; return { invalidate() {}, render(width: number) { return [theme.fg("accent", title), ...labels.map((label, index) => { const status = index < 2 ? (persistent[index] ? "✅" : "🔁") : index === 2 ? "❌" : "  "; const row = `${selected === index ? "› " : "  "}${status} ${label}`; return truncateToWidth(selected === index ? theme.bg("selectedBg", row) : row, width); }), theme.fg("dim", "↑↓ select · Space session/persist · Enter confirm · Ctrl+C cancel")]; }, handleInput(data: string) { if (matchesKey(data, Key.ctrl("c"))) return done(undefined); if (matchesKey(data, Key.up)) selected = Math.max(0, selected - 1); else if (matchesKey(data, Key.down)) selected = Math.min(3, selected + 1); else if (matchesKey(data, Key.space) && selected < 2) persistent[selected] = !persistent[selected]; else if (matchesKey(data, Key.enter)) done({ choice: (selected + 1) as 1 | 2 | 3 | 4, persistent: selected < 2 && persistent[selected] }); tui.requestRender(); } }; });
+type EditChoice = { choice: 1 | 2 | 3 | 4; persistent: boolean };
+async function showEditGate(ctx: ExtensionContext, title: string): Promise<EditChoice | undefined> {
+	const remote = webBridge()?.openDecision<string>({ kind: "select", title, detail: "Choose the scope of this write/edit permission.", options: ["allow directory once", "allow directory permanently", "allow file once", "allow file permanently", "deny", "enter a prompt for the assistant"] });
+	const fromWeb = (value: string): EditChoice | undefined => {
+		if (value === "allow directory once") return { choice: 1, persistent: false };
+		if (value === "allow directory permanently") return { choice: 1, persistent: true };
+		if (value === "allow file once") return { choice: 2, persistent: false };
+		if (value === "allow file permanently") return { choice: 2, persistent: true };
+		if (value === "enter a prompt for the assistant") return { choice: 4, persistent: false };
+		return { choice: 3, persistent: false };
+	};
+	if (ctx.mode !== "tui") return remote ? fromWeb(await remote.promise) : undefined;
+	return new Promise<EditChoice | undefined>((resolve) => ctx.ui.custom<EditChoice | undefined>((tui, theme, _kb, done) => {
+		let selected = 0; let settled = false; const persistent = [false, false]; const labels = ["1. Allow a directory", "2. Allow this file", "3. Deny", "4. Enter a prompt for the assistant"];
+		const finish = (value: EditChoice | undefined) => { if (settled) return; settled = true; remote?.resolve(value?.choice === 1 ? value.persistent ? "allow directory permanently" : "allow directory once" : value?.choice === 2 ? value.persistent ? "allow file permanently" : "allow file once" : "deny"); done(value); resolve(value); };
+		if (remote) remote.promise.then((value) => finish(fromWeb(value))).catch(() => undefined);
+		return { invalidate() {}, render(width: number) { return [theme.fg("accent", title), ...labels.map((label, index) => { const status = index < 2 ? (persistent[index] ? "✅" : "🔁") : index === 2 ? "❌" : "  "; const row = `${selected === index ? "› " : "  "}${status} ${label}`; return truncateToWidth(selected === index ? theme.bg("selectedBg", row) : row, width); }), theme.fg("dim", "↑↓ select · Space session/persist · Enter confirm · Ctrl+C cancel")]; }, handleInput(data: string) { if (matchesKey(data, Key.ctrl("c"))) return finish(undefined); if (matchesKey(data, Key.up)) selected = Math.max(0, selected - 1); else if (matchesKey(data, Key.down)) selected = Math.min(3, selected + 1); else if (matchesKey(data, Key.space) && selected < 2) persistent[selected] = !persistent[selected]; else if (matchesKey(data, Key.enter)) finish({ choice: (selected + 1) as 1 | 2 | 3 | 4, persistent: selected < 2 && persistent[selected] }); tui.requestRender(); } };
+	}));
+}
+
+async function showMirroredEditor(ctx: ExtensionContext, title: string, initial = ""): Promise<string | undefined> {
+	const remote = webBridge()?.openDecision<string | undefined>({ kind: "input", title, initial });
+	if (ctx.mode !== "tui") return remote?.promise;
+	return new Promise<string | undefined>((resolve) => ctx.ui.custom<string | undefined>((tui, theme, _kb, done) => {
+		const prompt = new PromptLine(); prompt.text = initial; prompt.cursor = initial.length; let settled = false;
+		const finish = (value: string | undefined) => { if (settled) return; settled = true; remote?.resolve(value); done(value); resolve(value); };
+		if (remote) remote.promise.then(finish).catch(() => undefined);
+		return { invalidate() {}, render(width: number) { return [theme.fg("accent", title), truncateToWidth(prompt.render(true), width), theme.fg("dim", "Enter confirm · Ctrl+C cancel")]; }, handleInput(data: string) { if (matchesKey(data, Key.ctrl("c")) || matchesKey(data, Key.escape)) return finish(undefined); if (matchesKey(data, Key.enter)) return finish(prompt.text); if (prompt.handle(data)) tui.requestRender(); } };
+	}));
 }
 
 async function gateEdit(pi: ExtensionAPI, ctx: ExtensionContext, toolName: string, input: unknown): Promise<{ block: true; reason: string } | undefined> {
@@ -125,8 +181,8 @@ async function gateEdit(pi: ExtensionAPI, ctx: ExtensionContext, toolName: strin
 	if (!ctx.hasUI) return within(resolve(ctx.cwd), path) ? undefined : { block: true, reason: `${NAME}: ${toolName} blocked without UI outside current directory` };
 	const selected = await showEditGate(ctx, `${toolName}: ${path}`);
 	if (!selected || selected.choice === 3) return { block: true, reason: `${NAME}: ${toolName} denied` };
-	if (selected.choice === 4) { const prompt = await ctx.ui.editor("Enter a prompt for the assistant"); if (prompt?.trim()) pi.sendUserMessage(prompt.trim(), { deliverAs: "steer" }); return { block: true, reason: `${NAME}: ${toolName} cancelled` }; }
-	if (selected.choice === 1) { const chosen = await ctx.ui.editor("Allowed directory", resolve(ctx.cwd)); if (!chosen?.trim()) return { block: true, reason: `${NAME}: directory permission cancelled` }; const dir = resolve(chosen.trim()); if (selected.persistent) { store.editDirectories.push(dir); await saveStore(storePath(ctx.cwd), store); } else sessionEditDirectories.add(dir); return undefined; }
+	if (selected.choice === 4) { const prompt = await showMirroredEditor(ctx, "Enter a prompt for the assistant"); if (prompt?.trim()) pi.sendUserMessage(prompt.trim(), { deliverAs: "steer" }); return { block: true, reason: `${NAME}: ${toolName} cancelled` }; }
+	if (selected.choice === 1) { const chosen = await showMirroredEditor(ctx, "Allowed directory", resolve(ctx.cwd)); if (!chosen?.trim()) return { block: true, reason: `${NAME}: directory permission cancelled` }; const dir = resolve(chosen.trim()); if (selected.persistent) { store.editDirectories.push(dir); await saveStore(storePath(ctx.cwd), store); } else sessionEditDirectories.add(dir); return undefined; }
 	if (selected.persistent) { store.editFiles.push(path); await saveStore(storePath(ctx.cwd), store); } else sessionEditFiles.add(path); return undefined;
 }
 

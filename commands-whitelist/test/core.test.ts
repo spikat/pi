@@ -32,6 +32,67 @@ test("does not mistake wc -c for a shell -c invocation", () => {
   ]);
 });
 
+test("does not reduce a dynamic executable to a fake wildcard command", () => {
+  const result = analyseShell(`set -euo pipefail
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+cp commit-msg/index.ts pr-description/index.ts review/index.ts "$work"/
+ln -s "$PWD/commands-whitelist/node_modules" "$work/node_modules"
+cat >"$work/tsconfig.json" <<'EOF'
+{ "include": ["*.ts"] }
+EOF
+(cd "$work" && "$PWD/node_modules/.bin/tsc" -p tsconfig.json)`);
+  assert.deepEqual(result.parts.map((part) => part.displayWords.join(" ")), [
+    "set -euo pipefail *",
+    "mktemp -d *",
+    "trap *",
+    "cp commit-msg/index.ts pr-description/index.ts review/index.ts *",
+    "ln -s *",
+    "cat *",
+    "cd *",
+    "$PWD/node_modules/.bin/tsc *",
+  ]);
+  assert.equal(result.parts.some((part) => part.displayWords.length === 1 && part.displayWords[0] === "*"), false);
+});
+
+test("does not turn command-substitution assignment arguments into commands", () => {
+  const result = analyseShell(`set -euo pipefail
+dir=$(mktemp -d); PI_WEB_RUNTIME_DIR="$dir" node web/server.mjs & pid=$!; for i in $(seq 1 50); do test -f "$dir/bridge.json" && break; sleep .1; done; token=$(node -p "require('$dir/bridge.json').browserToken"); curl -sk "https://localhost/?token=$token" > /tmp/pi-web-page.html; python3 - <<'PY'
+import re
+print('ignored')
+PY
+node --check /tmp/pi-web-client.js || true
+kill $pid; wait $pid || true; rm -rf "$dir"`);
+  assert.deepEqual(result.parts.map((part) => part.displayWords.join(" ")), [
+    "set -euo pipefail *",
+    "mktemp -d *",
+    "node web/server.mjs *",
+    "seq 1 50 *",
+    "test -f *",
+    "break *",
+    "sleep .1 *",
+    "node -p *",
+    "curl -sk *",
+    "python3 - *",
+    "node --check /tmp/pi-web-client.js *",
+    "true *",
+    "kill *",
+    "wait *",
+    "true *",
+    "rm -rf *",
+  ]);
+});
+
+test("does not split stderr redirections into a fake command", () => {
+  const result = analyseShell("(cd web && npm pack --dry-run 2>&1 | rg 'npm notice (📦|[0-9].* (README|index|server|package|LICENSE))' || true)");
+  assert.deepEqual(result.parts.map((part) => part.displayWords.join(" ")), [
+    "cd web *",
+    "npm pack --dry-run *",
+    "rg npm notice (📦|[0-9].* (README|index|server|package|LICENSE)) *",
+    "true *",
+  ]);
+});
+
 test("does not treat here-document bodies as shell commands", () => {
   const result = analyseShell(`mkdir -p web/test && cat > web/package.json <<'EOF'
 {
@@ -51,6 +112,16 @@ cd web && npm install --package-lock-only`);
     "cp LICENSE web/LICENSE *",
     "cd web *",
     "npm install --package-lock-only *",
+  ]);
+});
+
+test("does not treat Node here-document bodies as shell commands", () => {
+  const result = analyseShell("set -e\r\ncd commands-whitelist && npm version 1.1.0 --no-git-tag-version\r\nnode - <<'NODE'\r\nconst fs=require('fs');\r\nfor (const dir of ['commit-msg','pr-description','review']) {\r\n  const path = './package.json';\r\n  fs.writeFileSync(path, 'updated');\r\n}\r\nNODE");
+  assert.deepEqual(result.parts.map((part) => part.displayWords.join(" ")), [
+    "set -e *",
+    "cd commands-whitelist *",
+    "npm version 1.1.0 --no-git-tag-version *",
+    "node - *",
   ]);
 });
 

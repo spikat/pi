@@ -52,3 +52,7 @@ Then run:
 ```text
 /review
 ```
+
+## Pi Web
+
+When `@spikat/pi-web` is loaded in the same Pi process, `/review` can also be invoked from the local dashboard. The review output streams to the dashboard; the finding-by-finding fix decisions continue to use Pi's terminal UI.

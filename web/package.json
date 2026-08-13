@@ -1,0 +1,33 @@
+{
+  "name": "@spikat/pi-web",
+  "version": "0.1.0",
+  "description": "Local HTTPS bridge and live web dashboard for Pi sessions",
+  "license": "MIT",
+  "type": "module",
+  "keywords": ["pi-package", "pi", "pi-extension", "web", "dashboard", "websocket"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/spikat/pi.git",
+    "directory": "web"
+  },
+  "files": ["index.ts", "bridge.ts", "core.ts", "runtime.ts", "server.mjs", "README.md", "LICENSE"],
+  "scripts": {
+    "test": "tsx --test test/**/*.test.ts",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "selfsigned": "^2.4.1",
+    "ws": "^8.18.1"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.3"
+  },
+  "pi": { "extensions": ["./index.ts"] },
+  "publishConfig": { "access": "public" }
+}

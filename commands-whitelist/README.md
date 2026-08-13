@@ -65,6 +65,10 @@ Rules without `*` receive it automatically. A wildcard is valid only once and on
 
 The extension also keeps a gate for Pi `edit` and `write` calls. It supports an allow rule for a directory and all descendants, an exact-file allow rule, denial, and sending a prompt to the assistant. Session approvals remain only in memory; persistent approvals are stored in the configuration.
 
+## Pi Web integration
+
+When `@spikat/pi-web` is active for the same Pi session, shell-command and file-edit permission requests are displayed in both the terminal and the local web dashboard. A waiting browser dialog is inserted into the transcript after the triggering prompt and before later agent output, rather than below the message composer. The first valid response wins atomically and closes the other view. The browser shell-command review exposes the same per-command controls as the terminal: session-only/persistent allow and deny states, literal argument-prefix adjustment, Python-script restrictions, validation, an assistant prompt, cancellation, and contextual help. Browser file-edit reviews support one-time or persistent directory/file approval, denial, and the same mirrored assistant-prompt editor as the terminal.
+
 ## Configuration
 
 The configuration is located at:

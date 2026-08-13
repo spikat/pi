@@ -22,17 +22,20 @@ export function shellWords(source: string): { words: string[]; dynamic: boolean 
 	let quote: "'" | '"' | undefined;
 	let dynamic = false;
 	let escaped = false;
+	let substitutionDepth = 0;
 	for (let i = 0; i < source.length; i++) {
 		const c = source[i]!;
 		if (escaped) { current += c; escaped = false; continue; }
 		if (c === "\\" && quote !== "'") { escaped = true; continue; }
 		if ((c === "'" || c === '"') && !quote) { quote = c; continue; }
 		if (c === quote) { quote = undefined; continue; }
-		if (!quote && /\s/.test(c)) { if (current) { words.push(current); current = ""; } continue; }
+		if (!quote && c === "(" && source[i - 1] === "$") { substitutionDepth++; current += c; continue; }
+		if (!quote && c === ")" && substitutionDepth > 0) { substitutionDepth--; current += c; continue; }
+		if (!quote && substitutionDepth === 0 && /\s/.test(c)) { if (current) { words.push(current); current = ""; } continue; }
 		if (c === "$" && source[i + 1] !== "(" && source[i + 1] !== "{") dynamic = true;
 		current += c;
 	}
-	if (quote || escaped) return undefined;
+	if (quote || escaped || substitutionDepth !== 0) return undefined;
 	if (current) words.push(current);
 	return { words, dynamic };
 }
@@ -98,7 +101,8 @@ function removeHereDocumentBodies(command: string): string | undefined {
 		if (!hereDoc) continue;
 		let found = false;
 		while (++index < lines.length) {
-			const candidate = hereDoc.stripTabs ? lines[index]!.replace(/^\t+/, "") : lines[index]!;
+			const rawCandidate = lines[index]!.replace(/\r$/, "");
+			const candidate = hereDoc.stripTabs ? rawCandidate.replace(/^\t+/, "") : rawCandidate;
 			if (candidate === hereDoc.delimiter) { found = true; break; }
 			output.push("");
 		}
@@ -125,7 +129,9 @@ export function splitShellLists(command: string): string[] | undefined {
 		if (c === quote) { quote = undefined; current += c; continue; }
 		if (!quote && (c === "(" || c === "{")) { depth++; current += c; continue; }
 		if (!quote && (c === ")" || c === "}")) { if (depth === 0) return undefined; depth--; current += c; continue; }
-		if (!quote && depth === 0 && (c === "|" || c === ";" || c === "&" || c === "\n")) {
+		// `2>&1` is a redirection, not an asynchronous-command separator.
+		const redirectionAmpersand = c === "&" && command[i - 1] === ">";
+		if (!quote && depth === 0 && !redirectionAmpersand && (c === "|" || c === ";" || c === "&" || c === "\n")) {
 			if (current.trim()) parts.push(current.trim());
 			current = "";
 			if ((c === "|" && (next === "|" || next === "&")) || (c === "&" && next === "&")) i++;
@@ -166,7 +172,11 @@ function ruleWords(words: string[], dynamic: boolean): string[] {
 	const kept = words.slice(index).map(normalizeWord);
 	if (!kept.length) return [];
 	const dynamicIndex = dynamic ? kept.findIndex((word) => word.includes("$")) : -1;
-	if (dynamicIndex >= 0) return [...kept.slice(0, dynamicIndex), "*"];
+	// The command itself must always remain visible. A dynamic executable such as
+	// "$PWD/node_modules/.bin/tsc" is therefore retained, while its remaining
+	// arguments collapse to the terminal wildcard.
+	if (dynamicIndex === 0) return [kept[0]!, "*"];
+	if (dynamicIndex > 0) return [...kept.slice(0, dynamicIndex), "*"];
 	return [...kept, "*"];
 }
 
@@ -207,7 +217,11 @@ export function analyseShell(command: string): { parts: CommandPart[]; unsupport
 			continue;
 		}
 		const clean = stripRedirections(original).trim();
-		const parsed = shellWords(clean);
+		let parsed = shellWords(clean);
+		if (!parsed || !parsed.words.length) return { parts: [{ original: command, words: [], displayWords: [command, "*"], dynamic: false, unsupported: true }], unsupported: true };
+		// `do`, `then`, and `else` introduce a real command after a control-list
+		// separator; analyse that body rather than discarding the whole segment.
+		if (["do", "then", "else"].includes(parsed.words[0]!) && parsed.words.length > 1) parsed = shellWords(clean.replace(/^\s*(?:do|then|else)\s+/, ""));
 		if (!parsed || !parsed.words.length) return { parts: [{ original: command, words: [], displayWords: [command, "*"], dynamic: false, unsupported: true }], unsupported: true };
 		const first = parsed.words[0]!;
 		const pythonScript = isPythonScript(parsed.words);

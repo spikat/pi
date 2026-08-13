@@ -19,3 +19,8 @@ extensions:
     path: ./commands-whitelist
     command: /whitelist
     description: Review shell and file-edit actions and persist allow or deny rules.
+
+  - id: web
+    path: ./web
+    command: /web on
+    description: Connect Pi sessions to a local HTTPS live dashboard.

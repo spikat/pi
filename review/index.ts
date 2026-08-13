@@ -2,6 +2,11 @@ import { execFile } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const MAX_SECTION_CHARS = 50000;
+const WEB_BRIDGE_SYMBOL = Symbol.for("spikat.pi.web.bridge");
+const WEB_COMMAND_CONTRIBUTORS_SYMBOL = Symbol.for("spikat.pi.web.command-contributors");
+type WebBridge = { registerCommand(name: string, handler: (args: string) => Promise<void> | void): () => void };
+type WebContributor = (bridge: WebBridge) => void;
+function registerWebCommand(name: string, handler: (args: string) => Promise<void> | void): void { const global = globalThis as Record<symbol, unknown>; let contributors = global[WEB_COMMAND_CONTRIBUTORS_SYMBOL] as Set<WebContributor> | undefined; if (!contributors) { contributors = new Set(); global[WEB_COMMAND_CONTRIBUTORS_SYMBOL] = contributors; } const contributor: WebContributor = (bridge) => { bridge.registerCommand(name, handler); }; contributors.add(contributor); (global[WEB_BRIDGE_SYMBOL] as WebBridge | undefined)?.registerCommand(name, handler); }
 
 function runGit(args: string[], cwd: string): Promise<string> {
 	return new Promise((resolve, reject) => {
@@ -84,6 +89,8 @@ type ReviewState =
 
 export default function (pi: ExtensionAPI) {
 	let state: ReviewState = { mode: "idle" };
+	let current: ExtensionContext | undefined;
+	pi.on("session_start", async (_event, ctx) => { current = ctx; });
 
 	async function processNextFinding(ctx: ExtensionContext, findings: string[], startIndex: number): Promise<void> {
 		if (!ctx.hasUI) {
@@ -175,11 +182,7 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.registerCommand("review", {
-		description: "Review the current branch, staged changes, and unstaged changes",
-		handler: async (_args, ctx) => {
-			await ctx.waitForIdle();
-
+	async function runReview(ctx: ExtensionContext): Promise<void> {
 			try {
 				await runGit(["rev-parse", "--is-inside-work-tree"], ctx.cwd);
 			} catch {
@@ -292,6 +295,7 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify("Generating code review for current branch and working tree…", "info");
 			state = { mode: "awaiting-review" };
 			pi.sendUserMessage(prompt);
-		},
-	});
+	}
+	pi.registerCommand("review", { description: "Review the current branch, staged changes, and unstaged changes", handler: async (_args, ctx) => { await ctx.waitForIdle(); await runReview(ctx); } });
+	registerWebCommand("review", async () => { if (current?.isIdle()) await runReview(current); });
 }

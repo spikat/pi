@@ -1,4 +1,4 @@
-EXTENSIONS := commit-msg pr-description review commands-whitelist
+EXTENSIONS := commit-msg pr-description review commands-whitelist web
 OTP ?=
 PUBLISH_ARGS := --access public $(if $(OTP),--otp=$(OTP))
 

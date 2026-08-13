@@ -35,3 +35,7 @@ Then run:
 ```text
 /gen-commit-msg
 ```
+
+## Pi Web
+
+When `@spikat/pi-web` is loaded in the same Pi process, `/gen-commit-msg` can also be invoked from the local dashboard. Its generated response streams into the live web transcript.
