@@ -14,6 +14,9 @@ const agents = new Map();
 const browsers = new Set();
 const CERTIFICATE_DAYS = 365;
 const RENEW_CERTIFICATE_BEFORE_MS = 7 * 24 * 60 * 60 * 1000;
+const HISTORY_MAX_ENTRIES = 64;
+const HISTORY_MAX_CHARS = 512 * 1024;
+const HISTORY_ENTRY_MAX_CHARS = 64 * 1024;
 let idleTimer;
 
 const token = () => randomBytes(32).toString("base64url");
@@ -56,13 +59,25 @@ async function writeState(state) {
   await privateWrite(temporary, `${JSON.stringify(state)}\n`); await rename(temporary, stateFile); await chmod(stateFile, 0o600);
 }
 function snapshot() { return { type: "snapshot", agents: [...agents.values()].map(({ socket, ...agent }) => agent) }; }
+function boundedHistory(history) {
+  if (!Array.isArray(history)) return [];
+  let remaining = HISTORY_MAX_CHARS; const retained = [];
+  for (let index = history.length - 1; index >= 0 && retained.length < HISTORY_MAX_ENTRIES; index--) {
+    let length; try { length = JSON.stringify(history[index]).length; } catch { continue; }
+    if (length > HISTORY_ENTRY_MAX_CHARS) continue;
+    if (length > remaining) continue;
+    remaining -= length; retained.unshift(history[index]);
+  }
+  return retained;
+}
 function recordEvent(agent, event) {
   if (event.type === "agent_start") { agent.status = "busy"; agent.finished = false; }
   if (event.type === "agent_settled") { agent.status = "idle"; agent.finished = true; }
-  if (event.type === "message_start") { agent.history = [...(agent.history || []), { message: event.message, webTimestamp: event.timestamp }]; return; }
+  if (event.type === "message_start") { agent.history = boundedHistory([...(agent.history || []), { message: event.message, webTimestamp: event.timestamp }]); return; }
   if (event.type === "message_update" || event.type === "message_end") {
     const history = agent.history || (agent.history = []); const index = [...history].map((entry, position) => ({ entry, position })).reverse().find(({ entry }) => entry.message?.role === event.message?.role)?.position;
     if (index === undefined) history.push({ message: event.message, webTimestamp: event.timestamp }); else history[index] = { ...history[index], message: event.message, webTimestamp: event.timestamp };
+    agent.history = boundedHistory(history);
     return;
   }
   agent.events = [...(agent.events || []), event].slice(-300);
@@ -168,7 +183,7 @@ server.on('upgrade', (request, socket, head) => {
 wss.on('connection', (socket, _request, kind) => {
   if (kind === 'browser') { browsers.add(socket); send(socket, snapshot()); socket.on('close', () => browsers.delete(socket)); socket.on('message', (raw) => { let data; try { data = JSON.parse(String(raw)); } catch { return; } if (data?.type === 'input' && typeof data.agentId === 'string' && typeof data.text === 'string' && data.text.length <= 20000) agents.get(data.agentId)?.socket && send(agents.get(data.agentId).socket, { type: 'input', text: data.text }); if (data?.type === 'sync' && typeof data.agentId === 'string') send(agents.get(data.agentId)?.socket, { type: 'sync' }); if (data?.type === 'dialog_response' && typeof data.agentId === 'string' && typeof data.id === 'string') send(agents.get(data.agentId)?.socket, { type: 'dialog_response', id: data.id, value: data.value }); if (data?.type === 'rename' && typeof data.agentId === 'string' && typeof data.name === 'string' && data.name.length <= 200) send(agents.get(data.agentId)?.socket, { type: 'rename', text: data.name }); if (data?.type === 'disconnect' && typeof data.agentId === 'string') send(agents.get(data.agentId)?.socket, { type: 'disconnect' }); }); return; }
   let id;
-  socket.on('message', (raw) => { let data; try { data = JSON.parse(String(raw)); } catch { return; } if (data?.type === 'agent_hello' && data.metadata && typeof data.metadata.id === 'string') { id = data.metadata.id; const agent = { ...data.metadata, socket, dialogs: [], events: [] }; agents.set(id, agent); clearTimeout(idleTimer); broadcast({ type: 'agent_join', agent: snapshotAgent(agent) }); } else if (!id) return; else if (data.type === 'agent_update' && data.metadata) { const agent = agents.get(id); Object.assign(agent, data.metadata); broadcast({ type: 'agent_update', agent: { id, ...data.metadata } }); } else if (data.type === 'agent_event' && data.event) { const agent = agents.get(id); recordEvent(agent, data.event); broadcast({ type: 'agent_event', agentId: id, event: data.event }); } else if (data.type === 'dialog_open' && data.dialog) { const agent = agents.get(id); agent.status = 'waiting'; agent.finished = false; agent.dialogs = [...agent.dialogs.filter(x => x.id !== data.dialog.id), data.dialog]; broadcast({ type: 'dialog_open', agentId: id, dialog: data.dialog }); } else if (data.type === 'dialog_close' && typeof data.id === 'string') { const agent = agents.get(id); agent.dialogs = agent.dialogs.filter(x => x.id !== data.id); if (!agent.dialogs.length) agent.status = 'busy'; broadcast({ type: 'dialog_close', agentId: id, id: data.id }); } else if (data.type === 'agent_bye') { agents.delete(id); broadcast({ type: 'agent_leave', agentId: id }); stopIfUnused(); } });
+  socket.on('message', (raw) => { let data; try { data = JSON.parse(String(raw)); } catch { return; } if (data?.type === 'agent_hello' && data.metadata && typeof data.metadata.id === 'string') { id = data.metadata.id; const agent = { ...data.metadata, history: boundedHistory(data.metadata.history), socket, dialogs: [], events: [] }; agents.set(id, agent); clearTimeout(idleTimer); broadcast({ type: 'agent_join', agent: snapshotAgent(agent) }); } else if (!id) return; else if (data.type === 'agent_update' && data.metadata) { const agent = agents.get(id); const metadata = { ...data.metadata, ...(Object.hasOwn(data.metadata, 'history') ? { history: boundedHistory(data.metadata.history) } : {}) }; Object.assign(agent, metadata); broadcast({ type: 'agent_update', agent: { id, ...metadata } }); } else if (data.type === 'agent_event' && data.event) { const agent = agents.get(id); recordEvent(agent, data.event); broadcast({ type: 'agent_event', agentId: id, event: data.event }); } else if (data.type === 'dialog_open' && data.dialog) { const agent = agents.get(id); agent.status = 'waiting'; agent.finished = false; agent.dialogs = [...agent.dialogs.filter(x => x.id !== data.dialog.id), data.dialog]; broadcast({ type: 'dialog_open', agentId: id, dialog: data.dialog }); } else if (data.type === 'dialog_close' && typeof data.id === 'string') { const agent = agents.get(id); agent.dialogs = agent.dialogs.filter(x => x.id !== data.id); if (!agent.dialogs.length) agent.status = 'busy'; broadcast({ type: 'dialog_close', agentId: id, id: data.id }); } else if (data.type === 'agent_bye') { agents.delete(id); broadcast({ type: 'agent_leave', agentId: id }); stopIfUnused(); } });
   socket.on('close', () => { if (id && agents.get(id)?.socket === socket) { agents.delete(id); broadcast({ type: 'agent_leave', agentId: id }); stopIfUnused(); } });
 });
 function snapshotAgent(agent) { const { socket, ...result } = agent; return result; }

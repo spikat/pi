@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { advance, enqueue, isSafeMarkdownPath, renderMarkdown, resolveMarkdownPath, stripSensitiveToken, type QueueState } from "../core.js";
+import { HISTORY_ENTRY_MAX_CHARS, advance, compactForTransport, enqueue, isSafeMarkdownPath, renderMarkdown, resolveMarkdownPath, stripSensitiveToken, type QueueState } from "../core.js";
 
 test("queues browser input in FIFO order", () => {
 	let state: QueueState = { pending: [] };
@@ -29,6 +29,15 @@ test("markdown rendering escapes HTML and only keeps safe HTTP links", () => {
 	assert.match(rendered, /href="https:\/\/example.test"/);
 	assert.match(rendered, /\[javascript\]\(javascript:alert\(1\)\)/);
 	assert.match(rendered, /&lt;unsafe&gt;/);
+});
+
+test("bounds transport copies while preserving message structure", () => {
+	const source = { role: "assistant", content: [{ type: "text", text: "x".repeat(HISTORY_ENTRY_MAX_CHARS * 2) }] };
+	const compacted = compactForTransport(source, HISTORY_ENTRY_MAX_CHARS) as typeof source;
+	assert.equal(compacted.role, "assistant");
+	assert.equal(compacted.content[0]?.type, "text");
+	assert.match(compacted.content[0]?.text ?? "", /Truncated for Pi Web/);
+	assert.ok(JSON.stringify(compacted).length < HISTORY_ENTRY_MAX_CHARS + 1024);
 });
 
 test("removes the browser token without changing other URL data", () => {

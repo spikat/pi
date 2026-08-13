@@ -45,6 +45,28 @@ test("HTTPS bridge renews certificates that are close to expiry", async () => {
 	} finally { child.kill("SIGTERM"); await rm(runtime, { recursive: true, force: true }); }
 });
 
+test("HTTPS bridge bounds retained agent history", async () => {
+	const runtime = await mkdtemp(join(tmpdir(), "pi-web-")); const port = await freePort();
+	const child = spawn(process.execPath, [join(process.cwd(), "server.mjs")], { cwd: join(process.cwd()), env: { ...process.env, PI_WEB_RUNTIME_DIR: runtime, PI_WEB_PORT: String(port) }, stdio: "ignore" });
+	try {
+		const state = await eventually(async () => { try { return JSON.parse(await readFile(join(runtime, "bridge.json"), "utf8")) as { agentToken: string; browserToken: string }; } catch { return undefined; } });
+		const page = await get({ hostname: "localhost", port, path: `/?token=${state.browserToken}`, rejectUnauthorized: false });
+		const cookie = page.headers["set-cookie"]?.toString().split(";")[0]; assert.ok(cookie);
+		const browser = await open(`wss://localhost:${port}/ws`, { rejectUnauthorized: false, headers: { cookie, origin: `https://localhost:${port}` } });
+		await nextMessage(browser);
+		const agent = await open(`wss://127.0.0.1:${port}/ws`, { rejectUnauthorized: false, headers: { "x-pi-web-agent-token": state.agentToken } });
+		const history = Array.from({ length: 100 }, (_, index) => ({ id: `history-${index}`, message: { role: "assistant", content: [{ type: "text", text: "x".repeat(20_000) }] } }));
+		agent.send(JSON.stringify({ type: "agent_hello", metadata: { id: "agent-history", cwd: runtime, commands: [], history } }));
+		const joined = await nextMessage(browser);
+		const retained = ((joined.agent as { history: unknown[] }).history);
+		assert.ok(retained.length < history.length);
+		assert.ok(retained.length <= 64);
+		assert.ok(Buffer.byteLength(JSON.stringify(retained)) <= 512 * 1024);
+		assert.equal((retained.at(-1) as { id: string }).id, "history-99");
+		agent.close(); browser.close();
+	} finally { child.kill("SIGTERM"); await rm(runtime, { recursive: true, force: true }); }
+});
+
 test("HTTPS bridge authenticates the browser and relays agent state", async () => {
 	const runtime = await mkdtemp(join(tmpdir(), "pi-web-")); const port = await freePort();
 	const child = spawn(process.execPath, [join(process.cwd(), "server.mjs")], { cwd: join(process.cwd()), env: { ...process.env, PI_WEB_RUNTIME_DIR: runtime, PI_WEB_PORT: String(port) }, stdio: "ignore" });

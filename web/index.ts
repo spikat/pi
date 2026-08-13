@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { basename, isAbsolute, resolve } from "node:path";
 import { LocalWebBridge, applyWebCommandContributors, installWebBridge, type AgentMetadata } from "./bridge.js";
+import { HISTORY_ENTRY_MAX_CHARS, HISTORY_MAX_CHARS, HISTORY_MAX_ENTRIES, HISTORY_PROMPT_LIMIT, compactForTransport } from "./core.js";
 import { DEFAULT_PORT, readBridgeState } from "./runtime.js";
 
 const bridge = new LocalWebBridge();
@@ -8,16 +9,29 @@ installWebBridge(bridge);
 applyWebCommandContributors(bridge);
 
 type ToolPath = { path: string; toolName: string };
+const EVENT_MAX_CHARS = 64 * 1024;
 
-function plain(value: unknown): unknown {
-	try { return JSON.parse(JSON.stringify(value)); } catch { return String(value); }
-}
+function plain(value: unknown, maxChars = EVENT_MAX_CHARS): unknown { return compactForTransport(value, maxChars); }
+function serializedLength(value: unknown): number { try { return JSON.stringify(value).length; } catch { return Number.POSITIVE_INFINITY; } }
 
 function history(ctx: ExtensionContext): unknown[] {
-	return ctx.sessionManager.getEntries().flatMap((entry) => {
+	const entries = ctx.sessionManager.getEntries().flatMap((entry) => {
 		const candidate = entry as { type?: unknown; id?: unknown; message?: unknown };
-		return candidate.type === "message" && candidate.message ? [{ id: candidate.id, message: plain(candidate.message) }] : [];
+		return candidate.type === "message" && candidate.message ? [{ id: candidate.id, message: candidate.message }] : [];
 	});
+	const prompts = entries.map((entry, index) => (entry.message as { role?: unknown }).role === "user" ? index : -1).filter((index) => index >= 0);
+	const start = prompts.length ? prompts[Math.max(0, prompts.length - HISTORY_PROMPT_LIMIT)]! : Math.max(0, entries.length - 6);
+	let remaining = HISTORY_MAX_CHARS;
+	const retained: unknown[] = [];
+	for (let index = entries.length - 1; index >= start && retained.length < HISTORY_MAX_ENTRIES && remaining > 0; index--) {
+		const entry = entries[index]!;
+		const item = { id: entry.id, message: plain(entry.message, Math.min(HISTORY_ENTRY_MAX_CHARS, remaining)) };
+		const length = serializedLength(item);
+		if (length > remaining) continue;
+		remaining -= length;
+		retained.unshift(item);
+	}
+	return retained;
 }
 
 function metadata(pi: ExtensionAPI, ctx: ExtensionContext): AgentMetadata {
