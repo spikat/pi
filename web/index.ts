@@ -9,7 +9,8 @@ const bridge = new LocalWebBridge();
 installWebBridge(bridge);
 applyWebCommandContributors(bridge);
 
-type ToolPath = { path: string; toolName: string; before?: string };
+type ToolPath = { path: string; toolName: string; before?: string; existed: boolean };
+type PreviousFile = { before?: string; existed: boolean };
 
 const MAX_PREVIEW_FILE_CHARS = 512 * 1024;
 const PREVIEW_EXTENSIONS = new Set([".md", ".txt", ".go", ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".py", ".rb", ".rs", ".java", ".kt", ".sh", ".bash", ".zsh", ".fish", ".sql", ".html", ".css", ".scss", ".xml", ".dockerfile"]);
@@ -60,12 +61,12 @@ function previewPathFromArgs(cwd: string, value: unknown): string | undefined {
 	return PREVIEW_EXTENSIONS.has(extname(path).toLowerCase()) || PREVIEW_BASENAMES.has(basename(path).toLowerCase()) ? path : undefined;
 }
 
-async function previousFileContent(path: string): Promise<string | undefined> {
+async function previousFileContent(path: string): Promise<PreviousFile> {
 	try {
 		const source = await readFile(path, "utf8");
-		return source.length <= MAX_PREVIEW_FILE_CHARS && !source.includes("\0") ? source : undefined;
+		return { before: source.length <= MAX_PREVIEW_FILE_CHARS && !source.includes("\0") ? source : undefined, existed: true };
 	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "ENOENT" ? "" : undefined;
+		return (error as NodeJS.ErrnoException).code === "ENOENT" ? { before: "", existed: false } : { existed: true };
 	}
 }
 
@@ -76,6 +77,7 @@ export default function (pi: ExtensionAPI) {
 	const pendingInputs: string[] = [];
 	let pendingInputChars = 0;
 	const writePaths = new Map<string, ToolPath>();
+	const filesCreatedDuringTask = new Set<string>();
 	const emitQueue = () => bridge.emit("queue", { pending: pendingInputs.length, characters: pendingInputChars, maxPending: BROWSER_QUEUE_MAX_ITEMS, maxCharacters: BROWSER_QUEUE_MAX_CHARS });
 	const clearPendingInputs = () => { const count = pendingInputs.length; pendingInputs.length = 0; pendingInputChars = 0; emitQueue(); return count; };
 
@@ -140,7 +142,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", async () => { enabled = false; pendingInputs.length = 0; pendingInputChars = 0; bridge.disconnect(); current = undefined; });
 	pi.on("session_info_changed", async (_event, ctx) => { if (enabled) bridge.update(metadata(pi, ctx)); });
 	pi.on("model_select", async (_event, ctx) => { if (enabled) bridge.update(metadata(pi, ctx)); });
-	pi.on("agent_start", async (_event, ctx) => { current = ctx; if (enabled) bridge.emit("agent_start", {}); });
+	pi.on("agent_start", async (_event, ctx) => { current = ctx; filesCreatedDuringTask.clear(); if (enabled) bridge.emit("agent_start", {}); });
 	pi.on("agent_settled", async (_event, ctx) => { current = ctx; dispatching = false; if (enabled) { bridge.update({ history: history(ctx) }); bridge.emit("agent_settled", { pending: pendingInputs.length }); dispatchNext(); } });
 	pi.on("message_start", async (event, ctx) => { current = ctx; if (enabled) bridge.emit("message_start", { message: plain(event.message) as Record<string, unknown> }); });
 	pi.on("message_update", async (event, ctx) => { current = ctx; if (enabled) bridge.emit("message_update", { message: plain(event.message) as Record<string, unknown> }); });
@@ -149,7 +151,7 @@ export default function (pi: ExtensionAPI) {
 		current = ctx;
 		const value = event as unknown as { toolCallId: string; toolName: string; args: unknown };
 		const path = (value.toolName === "write" || value.toolName === "edit") ? previewPathFromArgs(ctx.cwd, value.args) : undefined;
-		if (path) writePaths.set(value.toolCallId, { path, toolName: value.toolName, before: await previousFileContent(path) });
+		if (path) { const previous = await previousFileContent(path); writePaths.set(value.toolCallId, { path, toolName: value.toolName, ...previous }); }
 		if (enabled) bridge.emit("tool_start", { toolCallId: value.toolCallId, toolName: value.toolName, args: plain(value.args) as Record<string, unknown> });
 	});
 	pi.on("tool_execution_update", async (event, ctx) => { current = ctx; if (enabled) { const value = event as unknown as { toolCallId: string; toolName: string; partialResult: unknown }; bridge.emit("tool_update", { toolCallId: value.toolCallId, toolName: value.toolName, result: plain(value.partialResult) as Record<string, unknown> }); } });
@@ -158,6 +160,10 @@ export default function (pi: ExtensionAPI) {
 		const value = event as unknown as { toolCallId: string; toolName: string; result: unknown; isError: boolean };
 		if (enabled) bridge.emit("tool_end", { toolCallId: value.toolCallId, toolName: value.toolName, result: plain(value.result) as Record<string, unknown>, isError: value.isError });
 		const changed = writePaths.get(value.toolCallId); writePaths.delete(value.toolCallId);
-		if (enabled && changed && !value.isError) bridge.emit("file_changed", { path: changed.path, toolName: changed.toolName, before: changed.before, diffAvailable: changed.before !== undefined });
+		if (enabled && changed && !value.isError) {
+			const created = !changed.existed || filesCreatedDuringTask.has(changed.path);
+			if (!changed.existed) filesCreatedDuringTask.add(changed.path);
+			bridge.emit("file_changed", { path: changed.path, toolName: changed.toolName, before: created ? undefined : changed.before, diffAvailable: !created && changed.before !== undefined });
+		}
 	});
 }
