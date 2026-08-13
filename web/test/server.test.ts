@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { X509Certificate } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer as createNetServer } from "node:net";
 import { request } from "node:https";
 import { tmpdir } from "node:os";
@@ -108,6 +108,16 @@ test("HTTPS bridge authenticates the browser and relays agent state", async () =
 		assert.equal(untrackedDiff.status, 404);
 		const escapedFile = await get({ hostname: "localhost", port, path: "/file?agent=agent-1&path=../outside.go", rejectUnauthorized: false, headers: { cookie } });
 		assert.equal(escapedFile.status, 404);
+		const outside = await mkdtemp(join(tmpdir(), "pi-web-outside-"));
+		try {
+			const secret = join(outside, "secret.md");
+			await writeFile(secret, "outside project");
+			await symlink(secret, join(runtime, "linked-secret.md"));
+			const linkedFile = await get({ hostname: "localhost", port, path: "/file?agent=agent-1&path=linked-secret.md", rejectUnauthorized: false, headers: { cookie } });
+			const linkedMarkdown = await get({ hostname: "localhost", port, path: "/markdown?agent=agent-1&path=linked-secret.md", rejectUnauthorized: false, headers: { cookie } });
+			assert.equal(linkedFile.status, 404);
+			assert.equal(linkedMarkdown.status, 404);
+		} finally { await rm(outside, { recursive: true, force: true }); }
 		browser.send(JSON.stringify({ type: "input", agentId: "agent-1", text: "queued browser prompt" }));
 		assert.deepEqual(await nextMessage(agent), { type: "input", text: "queued browser prompt" });
 		browser.send(JSON.stringify({ type: "clear_queue", agentId: "agent-1" }));

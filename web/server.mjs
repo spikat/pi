@@ -1,8 +1,8 @@
 import { execFile } from "node:child_process";
 import { createServer } from "node:https";
 import { randomBytes, timingSafeEqual, X509Certificate } from "node:crypto";
-import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { basename, extname, isAbsolute, join, relative, resolve } from "node:path";
+import { chmod, lstat, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import selfsigned from "selfsigned";
 import { WebSocketServer, WebSocket } from "ws";
@@ -98,18 +98,34 @@ function stopIfUnused() {
   if (agents.size) return;
   idleTimer = setTimeout(async () => { if (agents.size) return; await rm(stateFile, { force: true }); server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 1000).unref(); }, 3000);
 }
-function safeMarkdown(cwd, requested) {
-  if (typeof requested !== "string" || !requested.toLowerCase().endsWith(".md")) return undefined;
-  const path = isAbsolute(requested) ? resolve(requested) : resolve(cwd, requested);
-  const rel = relative(resolve(cwd), path);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel)) ? path : undefined;
+function within(parent, child) {
+  const rel = relative(parent, child);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
-function safePreviewFile(cwd, requested) {
+async function containsSymbolicLink(cwd, path) {
+  let current = resolve(cwd);
+  for (const component of relative(current, path).split(sep).filter(Boolean)) {
+    current = join(current, component);
+    if ((await lstat(current)).isSymbolicLink()) return true;
+  }
+  return false;
+}
+/** Reject links and non-regular files, then verify the resolved target remains in the project. */
+async function safeProjectFile(cwd, requested, accepted) {
   if (typeof requested !== "string") return undefined;
   const path = isAbsolute(requested) ? resolve(requested) : resolve(cwd, requested);
-  const rel = relative(resolve(cwd), path);
-  if (rel.startsWith("..") || isAbsolute(rel)) return undefined;
-  return PREVIEW_EXTENSIONS.has(extname(path).toLowerCase()) || PREVIEW_BASENAMES.has(basename(path).toLowerCase()) ? path : undefined;
+  if (!within(resolve(cwd), path) || !accepted(path)) return undefined;
+  try {
+    const [root, target, details, linked] = await Promise.all([realpath(cwd), realpath(path), lstat(path), containsSymbolicLink(cwd, path)]);
+    if (linked || details.isSymbolicLink() || !details.isFile() || !within(root, target)) return undefined;
+    return { path, target };
+  } catch { return undefined; }
+}
+function safeMarkdown(cwd, requested) {
+  return safeProjectFile(cwd, requested, (path) => path.toLowerCase().endsWith(".md"));
+}
+function safePreviewFile(cwd, requested) {
+  return safeProjectFile(cwd, requested, (path) => PREVIEW_EXTENSIONS.has(extname(path).toLowerCase()) || PREVIEW_BASENAMES.has(basename(path).toLowerCase()));
 }
 async function readTextPreview(path) {
   const source = await readFile(path);
@@ -231,21 +247,21 @@ const server = createServer(tls, async (request, response) => {
   if (url.pathname === '/health') { response.writeHead(agentAuthorised(request, state) ? 204 : 403); response.end(); return; }
   if (url.pathname === '/markdown') {
     if (!browserAuthorised(request, state)) { response.writeHead(401); response.end('Unauthorised'); return; }
-    const agent = agents.get(url.searchParams.get('agent')); const path = agent && safeMarkdown(agent.cwd, url.searchParams.get('path'));
-    if (!path) { response.writeHead(404); response.end('Markdown file unavailable'); return; }
-    try { const source = await readFile(path, 'utf8'); response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }); response.end(page(path, `<h1>${escapeHtml(path)}</h1>${markdown(source)}`)); } catch { response.writeHead(404); response.end('Markdown file unavailable'); }
+    const agent = agents.get(url.searchParams.get('agent')); const file = agent && await safeMarkdown(agent.cwd, url.searchParams.get('path'));
+    if (!file) { response.writeHead(404); response.end('Markdown file unavailable'); return; }
+    try { const source = await readFile(file.target, 'utf8'); response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }); response.end(page(file.path, `<h1>${escapeHtml(file.path)}</h1>${markdown(source)}`)); } catch { response.writeHead(404); response.end('Markdown file unavailable'); }
     return;
   }
   if (url.pathname === '/file') {
     if (!browserAuthorised(request, state)) { response.writeHead(401); response.end('Unauthorised'); return; }
-    const agent = agents.get(url.searchParams.get('agent')); const path = agent && safePreviewFile(agent.cwd, url.searchParams.get('path'));
-    if (!path) { response.writeHead(404); response.end('File unavailable'); return; }
+    const agent = agents.get(url.searchParams.get('agent')); const file = agent && await safePreviewFile(agent.cwd, url.searchParams.get('path'));
+    if (!file) { response.writeHead(404); response.end('File unavailable'); return; }
     try {
-      const content = await readTextPreview(path); const mode = url.searchParams.get('mode') === 'diff' ? 'diff' : 'file';
-      const diff = mode === 'diff' ? await gitDiff(agent.cwd, path) : undefined;
+      const content = await readTextPreview(file.target); const mode = url.searchParams.get('mode') === 'diff' ? 'diff' : 'file';
+      const diff = mode === 'diff' ? await gitDiff(agent.cwd, file.path) : undefined;
       if (mode === 'diff' && !diff) { response.writeHead(404); response.end('A Git diff is unavailable for this file'); return; }
       response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
-      response.end(JSON.stringify({ path, language: languageForPath(path), mode, content, ...(mode === 'diff' ? { diff } : {}) }));
+      response.end(JSON.stringify({ path: file.path, language: languageForPath(file.path), mode, content, ...(mode === 'diff' ? { diff } : {}) }));
     } catch (error) { response.writeHead(404); response.end(error instanceof Error ? error.message : 'File unavailable'); }
     return;
   }
