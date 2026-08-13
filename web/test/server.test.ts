@@ -118,6 +118,17 @@ test("HTTPS bridge authenticates the browser and relays agent state", async () =
 			assert.equal(linkedFile.status, 404);
 			assert.equal(linkedMarkdown.status, 404);
 		} finally { await rm(outside, { recursive: true, force: true }); }
+		await writeFile(join(runtime, "oversized.md"), "x".repeat(512 * 1024 + 1));
+		const oversizedFile = await get({ hostname: "localhost", port, path: "/file?agent=agent-1&path=oversized.md", rejectUnauthorized: false, headers: { cookie } });
+		const oversizedMarkdown = await get({ hostname: "localhost", port, path: "/markdown?agent=agent-1&path=oversized.md", rejectUnauthorized: false, headers: { cookie } });
+		assert.equal(oversizedFile.status, 404);
+		assert.equal(oversizedMarkdown.status, 404);
+		const fifo = join(runtime, "preview.fifo.md");
+		await execFileAsync("mkfifo", [fifo]);
+		const specialFile = await get({ hostname: "localhost", port, path: "/file?agent=agent-1&path=preview.fifo.md", rejectUnauthorized: false, headers: { cookie } });
+		const specialMarkdown = await get({ hostname: "localhost", port, path: "/markdown?agent=agent-1&path=preview.fifo.md", rejectUnauthorized: false, headers: { cookie } });
+		assert.equal(specialFile.status, 404);
+		assert.equal(specialMarkdown.status, 404);
 		browser.send(JSON.stringify({ type: "input", agentId: "agent-1", text: "queued browser prompt" }));
 		assert.deepEqual(await nextMessage(agent), { type: "input", text: "queued browser prompt" });
 		browser.send(JSON.stringify({ type: "clear_queue", agentId: "agent-1" }));

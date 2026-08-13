@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
 import { createServer } from "node:https";
 import { randomBytes, timingSafeEqual, X509Certificate } from "node:crypto";
-import { chmod, lstat, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import selfsigned from "selfsigned";
@@ -128,9 +129,17 @@ function safePreviewFile(cwd, requested) {
   return safeProjectFile(cwd, requested, (path) => PREVIEW_EXTENSIONS.has(extname(path).toLowerCase()) || PREVIEW_BASENAMES.has(basename(path).toLowerCase()));
 }
 async function readTextPreview(path) {
-  const source = await readFile(path);
-  if (source.length > MAX_PREVIEW_FILE_BYTES || source.includes(0)) throw new Error("File is binary or too large to preview");
-  return source.toString("utf8");
+  const entry = await lstat(path);
+  if (entry.isSymbolicLink() || !entry.isFile() || entry.size > MAX_PREVIEW_FILE_BYTES) throw new Error("File is not a regular text file or is too large to preview");
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const details = await handle.stat();
+    if (!details.isFile() || details.size > MAX_PREVIEW_FILE_BYTES) throw new Error("File is not a regular text file or is too large to preview");
+    const source = Buffer.alloc(Math.min(MAX_PREVIEW_FILE_BYTES + 1, details.size + 1));
+    const { bytesRead } = await handle.read(source, 0, source.length, 0);
+    if (bytesRead > MAX_PREVIEW_FILE_BYTES || source.subarray(0, bytesRead).includes(0)) throw new Error("File is binary or too large to preview");
+    return source.subarray(0, bytesRead).toString("utf8");
+  } finally { await handle.close(); }
 }
 async function gitDiff(cwd, path) {
   const pathInRepository = relative(resolve(cwd), path);
@@ -249,7 +258,7 @@ const server = createServer(tls, async (request, response) => {
     if (!browserAuthorised(request, state)) { response.writeHead(401); response.end('Unauthorised'); return; }
     const agent = agents.get(url.searchParams.get('agent')); const file = agent && await safeMarkdown(agent.cwd, url.searchParams.get('path'));
     if (!file) { response.writeHead(404); response.end('Markdown file unavailable'); return; }
-    try { const source = await readFile(file.target, 'utf8'); response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }); response.end(page(file.path, `<h1>${escapeHtml(file.path)}</h1>${markdown(source)}`)); } catch { response.writeHead(404); response.end('Markdown file unavailable'); }
+    try { const source = await readTextPreview(file.target); response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }); response.end(page(file.path, `<h1>${escapeHtml(file.path)}</h1>${markdown(source)}`)); } catch { response.writeHead(404); response.end('Markdown file unavailable'); }
     return;
   }
   if (url.pathname === '/file') {
