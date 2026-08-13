@@ -37,6 +37,7 @@ export type WebBridge = {
 	onInput(handler: (text: string) => void): void;
 	onRename(handler: (name: string) => void): void;
 	onDisconnect(handler: () => void): void;
+	onClearQueue(handler: () => void): void;
 	onSync(handler: () => void): void;
 };
 
@@ -52,6 +53,7 @@ export class LocalWebBridge implements WebBridge {
 	#inputHandler: ((text: string) => void) | undefined;
 	#renameHandler: ((name: string) => void) | undefined;
 	#disconnectHandler: (() => void) | undefined;
+	#clearQueueHandler: (() => void) | undefined;
 	#syncHandler: (() => void) | undefined;
 	#reconnectTimer: NodeJS.Timeout | undefined;
 	#outbox: string[] = [];
@@ -110,6 +112,7 @@ export class LocalWebBridge implements WebBridge {
 	onInput(handler: (text: string) => void): void { this.#inputHandler = handler; }
 	onRename(handler: (name: string) => void): void { this.#renameHandler = handler; }
 	onDisconnect(handler: () => void): void { this.#disconnectHandler = handler; }
+	onClearQueue(handler: () => void): void { this.#clearQueueHandler = handler; }
 	onSync(handler: () => void): void { this.#syncHandler = handler; }
 
 	#open(): void {
@@ -156,6 +159,7 @@ export class LocalWebBridge implements WebBridge {
 		if (message.type === "dialog_response" && typeof message.id === "string") this.#pending.get(message.id)?.resolve(message.value);
 		if (message.type === "rename" && typeof message.text === "string") { this.#renameHandler?.(message.text); return; }
 		if (message.type === "disconnect") { this.#disconnectHandler?.(); return; }
+		if (message.type === "clear_queue") { this.#clearQueueHandler?.(); return; }
 		if (message.type === "input" && typeof message.text === "string") {
 			const [command, ...rest] = message.text.trim().slice(1).split(/\s+/);
 			if (message.text.startsWith("/") && command && this.#commands.has(command)) {

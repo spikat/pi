@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { basename, isAbsolute, resolve } from "node:path";
 import { LocalWebBridge, applyWebCommandContributors, installWebBridge, type AgentMetadata } from "./bridge.js";
-import { HISTORY_ENTRY_MAX_CHARS, HISTORY_MAX_CHARS, HISTORY_MAX_ENTRIES, HISTORY_PROMPT_LIMIT, compactForTransport } from "./core.js";
+import { BROWSER_QUEUE_MAX_CHARS, BROWSER_QUEUE_MAX_ITEMS, HISTORY_ENTRY_MAX_CHARS, HISTORY_MAX_CHARS, HISTORY_MAX_ENTRIES, HISTORY_PROMPT_LIMIT, canQueueBrowserInput, compactForTransport } from "./core.js";
 import { DEFAULT_PORT, readBridgeState } from "./runtime.js";
 
 const bridge = new LocalWebBridge();
@@ -59,13 +59,17 @@ export default function (pi: ExtensionAPI) {
 	let enabled = false;
 	let dispatching = false;
 	const pendingInputs: string[] = [];
+	let pendingInputChars = 0;
 	const writePaths = new Map<string, ToolPath>();
+	const emitQueue = () => bridge.emit("queue", { pending: pendingInputs.length, characters: pendingInputChars, maxPending: BROWSER_QUEUE_MAX_ITEMS, maxCharacters: BROWSER_QUEUE_MAX_CHARS });
+	const clearPendingInputs = () => { const count = pendingInputs.length; pendingInputs.length = 0; pendingInputChars = 0; emitQueue(); return count; };
 
 	const dispatchNext = () => {
 		if (!enabled || dispatching || !current || !pendingInputs.length || !current.isIdle()) return;
 		dispatching = true;
 		const text = pendingInputs.shift()!;
-		bridge.emit("queue", { pending: pendingInputs.length, active: text });
+		pendingInputChars = Math.max(0, pendingInputChars - text.length);
+		emitQueue();
 		try { pi.sendUserMessage(text); }
 		catch (error) { bridge.emit("error", { message: error instanceof Error ? error.message : String(error) }); dispatching = false; dispatchNext(); }
 	};
@@ -73,8 +77,13 @@ export default function (pi: ExtensionAPI) {
 	bridge.onRename((name) => { if (enabled) pi.setSessionName(name.trim()); });
 	bridge.onDisconnect(() => {
 		if (!enabled) return;
-		enabled = false; pendingInputs.length = 0; bridge.disconnect();
+		enabled = false; pendingInputs.length = 0; pendingInputChars = 0; bridge.disconnect();
 		current?.ui.notify("Disconnected from Pi Web by a browser client.", "warning");
+	});
+	bridge.onClearQueue(() => {
+		if (!enabled) return;
+		const count = clearPendingInputs();
+		if (count) bridge.emit("status", { message: `Discarded ${count} queued browser prompt${count === 1 ? "" : "s"}.` });
 	});
 
 	bridge.onSync(() => { if (enabled && current) bridge.update({ history: history(current) }); });
@@ -83,8 +92,9 @@ export default function (pi: ExtensionAPI) {
 		if (!enabled || !current) return;
 		if (!text.trim()) return;
 		if (text.startsWith("/")) { bridge.emit("error", { message: `This agent cannot execute ${text.split(/\s+/, 1)[0]} through Pi Web. It is listed for completion, but only commands that explicitly opt into Pi Web can be invoked remotely.` }); return; }
-		pendingInputs.push(text);
-		bridge.emit("queue", { pending: pendingInputs.length, active: dispatching ? "running" : undefined });
+		if (!canQueueBrowserInput(pendingInputs.length, pendingInputChars, text)) { bridge.emit("error", { message: `Browser prompt queue is full (maximum ${BROWSER_QUEUE_MAX_ITEMS} prompts or ${BROWSER_QUEUE_MAX_CHARS} characters). Drop queued prompts before sending more.` }); emitQueue(); return; }
+		pendingInputs.push(text); pendingInputChars += text.length;
+		emitQueue();
 		dispatchNext();
 	});
 
@@ -105,14 +115,14 @@ export default function (pi: ExtensionAPI) {
 				} catch (error) { ctx.ui.notify(`Unable to start Pi Web: ${error instanceof Error ? error.message : String(error)}`, "error"); }
 				return;
 			}
-			if (command === "off") { enabled = false; pendingInputs.length = 0; bridge.disconnect(); ctx.ui.notify("This Pi session disconnected from the web dashboard", "info"); return; }
+			if (command === "off") { enabled = false; pendingInputs.length = 0; pendingInputChars = 0; bridge.disconnect(); ctx.ui.notify("This Pi session disconnected from the web dashboard", "info"); return; }
 			if (command === "status") { ctx.ui.notify(enabled ? "This Pi session is connected to Pi Web." : "This Pi session is not connected to Pi Web.", "info"); return; }
 			ctx.ui.notify("Usage: /web [on [port]|off|status]", "warning");
 		},
 	});
 
 	pi.on("session_start", async (_event, ctx) => { current = ctx; });
-	pi.on("session_shutdown", async () => { enabled = false; pendingInputs.length = 0; bridge.disconnect(); current = undefined; });
+	pi.on("session_shutdown", async () => { enabled = false; pendingInputs.length = 0; pendingInputChars = 0; bridge.disconnect(); current = undefined; });
 	pi.on("session_info_changed", async (_event, ctx) => { if (enabled) bridge.update(metadata(pi, ctx)); });
 	pi.on("model_select", async (_event, ctx) => { if (enabled) bridge.update(metadata(pi, ctx)); });
 	pi.on("agent_start", async (_event, ctx) => { current = ctx; if (enabled) bridge.emit("agent_start", {}); });

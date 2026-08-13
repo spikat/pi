@@ -75,7 +75,7 @@ test("HTTPS bridge authenticates the browser and relays agent state", async () =
 		const health = await get({ hostname: "127.0.0.1", port, path: "/health", rejectUnauthorized: false, headers: { "x-pi-web-agent-token": state.agentToken } });
 		assert.equal(health.status, 204);
 		const page = await get({ hostname: "localhost", port, path: `/?token=${state.browserToken}`, rejectUnauthorized: false });
-		assert.equal(page.status, 200); assert.match(page.body, /Show agent reasoning/); assert.match(page.body, /Desktop notifications/); assert.match(page.body, /Mute agent notifications/); assert.match(page.body, /Copy this agent message to the clipboard/); assert.match(page.body, /navigator\.clipboard\?\.writeText/); assert.match(page.body, /appendDocumentReferences/); assert.match(page.body, /isTableDivider/); assert.match(page.body, /appendDialogs\(messages,agent\)/); assert.match(page.body, /showThinking=false,showTools=false/); assert.match(page.body, /Validate current selection/); assert.match(page.body, /Enter a prompt for the assistant/);
+		assert.equal(page.status, 200); assert.match(page.body, /Show agent reasoning/); assert.match(page.body, /Desktop notifications/); assert.match(page.body, /Mute agent notifications/); assert.match(page.body, /Drop queued prompts/); assert.match(page.body, /Copy this agent message to the clipboard/); assert.match(page.body, /navigator\.clipboard\?\.writeText/); assert.match(page.body, /appendDocumentReferences/); assert.match(page.body, /isTableDivider/); assert.match(page.body, /appendDialogs\(messages,agent\)/); assert.match(page.body, /showThinking=false,showTools=false/); assert.match(page.body, /Validate current selection/); assert.match(page.body, /Enter a prompt for the assistant/);
 		const clientScript = /<script>([\s\S]*?)<\/script>/.exec(page.body)?.[1]; assert.ok(clientScript); assert.doesNotThrow(() => new Function(clientScript));
 		const cookie = page.headers["set-cookie"]?.toString().split(";")[0]; assert.ok(cookie);
 		const browser = await open(`wss://localhost:${port}/ws`, { rejectUnauthorized: false, headers: { cookie, origin: `https://localhost:${port}` } });
@@ -85,10 +85,14 @@ test("HTTPS bridge authenticates the browser and relays agent state", async () =
 		agent.send(JSON.stringify({ type: "agent_hello", metadata: { id: "agent-1", cwd: runtime, commands: [], history: [] } }));
 		const joined = await nextMessage(browser); assert.equal(joined.type, "agent_join");
 		assert.equal((joined.agent as { id: string }).id, "agent-1");
+		agent.send(JSON.stringify({ type: "agent_event", event: { type: "queue", pending: 2, characters: 42, maxPending: 20, maxCharacters: 100000 } }));
+		const queued = await nextMessage(browser); assert.equal(queued.type, "agent_event"); assert.equal(((queued.event as { pending: number }).pending), 2);
 		const preview = await get({ hostname: "localhost", port, path: "/markdown?agent=agent-1&path=format.md", rejectUnauthorized: false, headers: { cookie } });
 		assert.equal(preview.status, 200); assert.match(preview.body, /<table>/); assert.match(preview.body, /<strong>bold<\/strong>/); assert.match(preview.body, /<code>code<\/code>/); assert.match(preview.body, /<blockquote>/); assert.match(preview.body, /<pre><code>&gt; literal Markdown\nREADME\.md<\/code><\/pre>/);
 		browser.send(JSON.stringify({ type: "input", agentId: "agent-1", text: "queued browser prompt" }));
 		assert.deepEqual(await nextMessage(agent), { type: "input", text: "queued browser prompt" });
+		browser.send(JSON.stringify({ type: "clear_queue", agentId: "agent-1" }));
+		assert.deepEqual(await nextMessage(agent), { type: "clear_queue" });
 		browser.send(JSON.stringify({ type: "sync", agentId: "agent-1" }));
 		assert.deepEqual(await nextMessage(agent), { type: "sync" });
 		agent.send(JSON.stringify({ type: "dialog_open", dialog: { id: "gate-1", kind: "confirm", title: "Allow command?" } }));

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { HISTORY_ENTRY_MAX_CHARS, advance, compactForTransport, enqueue, isSafeMarkdownPath, renderMarkdown, resolveMarkdownPath, stripSensitiveToken, type QueueState } from "../core.js";
+import { BROWSER_QUEUE_MAX_CHARS, BROWSER_QUEUE_MAX_ITEMS, HISTORY_ENTRY_MAX_CHARS, advance, canQueueBrowserInput, compactForTransport, enqueue, isSafeMarkdownPath, renderMarkdown, resolveMarkdownPath, stripSensitiveToken, type QueueState } from "../core.js";
 
 test("queues browser input in FIFO order", () => {
 	let state: QueueState = { pending: [] };
@@ -11,6 +11,12 @@ test("queues browser input in FIFO order", () => {
 	state = advance(state);
 	assert.equal(state.active?.text, "second");
 	assert.deepEqual(advance(state), { pending: [] });
+});
+
+test("caps queued browser prompts by count and total size", () => {
+	assert.equal(canQueueBrowserInput(BROWSER_QUEUE_MAX_ITEMS - 1, 0, "prompt"), true);
+	assert.equal(canQueueBrowserInput(BROWSER_QUEUE_MAX_ITEMS, 0, "prompt"), false);
+	assert.equal(canQueueBrowserInput(0, BROWSER_QUEUE_MAX_CHARS - 1, "ab"), false);
 });
 
 test("markdown previews cannot escape the agent project", () => {

@@ -3,6 +3,12 @@ import { isAbsolute, relative, resolve } from "node:path";
 export type QueueItem = { id: string; text: string; receivedAt: number };
 export type QueueState = { active?: QueueItem; pending: QueueItem[] };
 
+export const BROWSER_QUEUE_MAX_ITEMS = 20;
+export const BROWSER_QUEUE_MAX_CHARS = 100_000;
+export function canQueueBrowserInput(pendingItems: number, pendingChars: number, input: string): boolean {
+	return pendingItems < BROWSER_QUEUE_MAX_ITEMS && pendingChars + input.length <= BROWSER_QUEUE_MAX_CHARS;
+}
+
 export const HISTORY_PROMPT_LIMIT = 3;
 export const HISTORY_MAX_ENTRIES = 64;
 export const HISTORY_MAX_CHARS = 512 * 1024;
