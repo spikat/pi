@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { X509Certificate } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer as createNetServer } from "node:net";
@@ -7,9 +7,12 @@ import { request } from "node:https";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import selfsigned from "selfsigned";
 import WebSocket from "ws";
 
+const execFileAsync = promisify(execFile);
+const git = (cwd: string, args: string[]) => execFileAsync("git", ["-C", cwd, ...args]);
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 async function freePort(): Promise<number> {
 	const server = createNetServer();
@@ -69,13 +72,14 @@ test("HTTPS bridge bounds retained agent history", async () => {
 
 test("HTTPS bridge authenticates the browser and relays agent state", async () => {
 	const runtime = await mkdtemp(join(tmpdir(), "pi-web-")); const port = await freePort();
+	await git(runtime, ["init", "--quiet"]);
 	const child = spawn(process.execPath, [join(process.cwd(), "server.mjs")], { cwd: join(process.cwd()), env: { ...process.env, PI_WEB_RUNTIME_DIR: runtime, PI_WEB_PORT: String(port) }, stdio: "ignore" });
 	try {
 		const state = await eventually(async () => { try { return JSON.parse(await readFile(join(runtime, "bridge.json"), "utf8")) as { agentToken: string; browserToken: string }; } catch { return undefined; } });
 		const health = await get({ hostname: "127.0.0.1", port, path: "/health", rejectUnauthorized: false, headers: { "x-pi-web-agent-token": state.agentToken } });
 		assert.equal(health.status, 204);
 		const page = await get({ hostname: "localhost", port, path: `/?token=${state.browserToken}`, rejectUnauthorized: false });
-		assert.equal(page.status, 200); assert.match(page.body, /Show agent reasoning/); assert.match(page.body, /Desktop notifications/); assert.match(page.body, /Mute agent notifications/); assert.match(page.body, /Drop queued prompts/); assert.match(page.body, /Copy this agent message to the clipboard/); assert.match(page.body, /navigator\.clipboard\?\.writeText/); assert.match(page.body, /appendFileReferences/); assert.match(page.body, /fileViewer/); assert.match(page.body, /View source/); assert.match(page.body, /language==='python'/); assert.match(page.body, /syntax-target/); assert.match(page.body, /diffRows/); assert.match(page.body, /isTableDivider/); assert.match(page.body, /appendDialogs\(messages,agent\)/); assert.match(page.body, /showThinking=false,showTools=false/); assert.match(page.body, /Validate current selection/); assert.match(page.body, /Enter a prompt for the assistant/);
+		assert.equal(page.status, 200); assert.match(page.body, /Show agent reasoning/); assert.match(page.body, /Desktop notifications/); assert.match(page.body, /Mute agent notifications/); assert.match(page.body, /Drop queued prompts/); assert.match(page.body, /Copy this agent message to the clipboard/); assert.match(page.body, /navigator\.clipboard\?\.writeText/); assert.match(page.body, /appendFileReferences/); assert.match(page.body, /fileViewer/); assert.match(page.body, /View source/); assert.match(page.body, /\.file-viewer>\.markdown\{box-sizing:border-box;padding:\.45rem \.8rem \.8rem\}/); assert.match(page.body, /focusFirstChange:true/); assert.match(page.body, /title:'Previous change'/); assert.match(page.body, /title:'Next change'/); assert.match(page.body, /scrollToDiffChange/); assert.match(page.body, /language==='python'/); assert.match(page.body, /syntax-target/); assert.match(page.body, /gitDiffRows/); assert.match(page.body, /isTableDivider/); assert.match(page.body, /appendDialogs\(messages,agent\)/); assert.match(page.body, /showThinking=false,showTools=false/); assert.match(page.body, /Validate current selection/); assert.match(page.body, /Enter a prompt for the assistant/);
 		const clientScript = /<script>([\s\S]*?)<\/script>/.exec(page.body)?.[1]; assert.ok(clientScript); assert.doesNotThrow(() => new Function(clientScript));
 		const cookie = page.headers["set-cookie"]?.toString().split(";")[0]; assert.ok(cookie);
 		const browser = await open(`wss://localhost:${port}/ws`, { rejectUnauthorized: false, headers: { cookie, origin: `https://localhost:${port}` } });
@@ -91,13 +95,17 @@ test("HTTPS bridge authenticates the browser and relays agent state", async () =
 		assert.equal(preview.status, 200); assert.match(preview.body, /<table>/); assert.match(preview.body, /<strong>bold<\/strong>/); assert.match(preview.body, /<code>code<\/code>/); assert.match(preview.body, /<blockquote>/); assert.match(preview.body, /<pre><code>&gt; literal Markdown\nREADME\.md<\/code><\/pre>/);
 		const markdownFile = await get({ hostname: "localhost", port, path: "/file?agent=agent-1&path=format.md", rejectUnauthorized: false, headers: { cookie } });
 		assert.equal(JSON.parse(markdownFile.body).language, "markdown");
+		const originalGo = "package main\n\nfunc main() { println(\"old\") }\n";
+		await writeFile(join(runtime, "example.go"), originalGo); await git(runtime, ["add", "--", "example.go"]);
 		await writeFile(join(runtime, "example.go"), "package main\n\nfunc main() { println(\"new\") }\n");
-		agent.send(JSON.stringify({ type: "agent_event", event: { type: "file_changed", path: join(runtime, "example.go"), before: "package main\n\nfunc main() { println(\"old\") }\n", diffAvailable: true } }));
+		agent.send(JSON.stringify({ type: "agent_event", event: { type: "file_changed", path: join(runtime, "example.go"), diffAvailable: true } }));
 		const changed = await nextMessage(browser); assert.equal(changed.type, "agent_event"); assert.equal((changed.event as { type: string }).type, "file_changed"); assert.equal(Object.hasOwn(changed.event as object, "before"), false);
 		const file = await get({ hostname: "localhost", port, path: "/file?agent=agent-1&path=example.go", rejectUnauthorized: false, headers: { cookie } });
 		assert.equal(file.status, 200); assert.deepEqual(JSON.parse(file.body), { path: join(runtime, "example.go"), language: "go", mode: "file", content: "package main\n\nfunc main() { println(\"new\") }\n" });
 		const diff = await get({ hostname: "localhost", port, path: "/file?agent=agent-1&path=example.go&mode=diff", rejectUnauthorized: false, headers: { cookie } });
-		assert.equal(diff.status, 200); assert.equal(JSON.parse(diff.body).before, "package main\n\nfunc main() { println(\"old\") }\n");
+		assert.equal(diff.status, 200); const gitDiff = JSON.parse(diff.body) as { diff: string }; assert.match(gitDiff.diff, /-func main\(\) \{ println\(\"old\"\) \}/); assert.match(gitDiff.diff, /\+func main\(\) \{ println\(\"new\"\) \}/);
+		const untrackedDiff = await get({ hostname: "localhost", port, path: "/file?agent=agent-1&path=format.md&mode=diff", rejectUnauthorized: false, headers: { cookie } });
+		assert.equal(untrackedDiff.status, 404);
 		const escapedFile = await get({ hostname: "localhost", port, path: "/file?agent=agent-1&path=../outside.go", rejectUnauthorized: false, headers: { cookie } });
 		assert.equal(escapedFile.status, 404);
 		browser.send(JSON.stringify({ type: "input", agentId: "agent-1", text: "queued browser prompt" }));
