@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { basename, isAbsolute, resolve } from "node:path";
+import { readFile } from "node:fs/promises";
+import { basename, extname, isAbsolute, resolve } from "node:path";
 import { LocalWebBridge, applyWebCommandContributors, installWebBridge, type AgentMetadata } from "./bridge.js";
 import { BROWSER_QUEUE_MAX_CHARS, BROWSER_QUEUE_MAX_ITEMS, HISTORY_ENTRY_MAX_CHARS, HISTORY_MAX_CHARS, HISTORY_MAX_ENTRIES, HISTORY_PROMPT_LIMIT, canQueueBrowserInput, compactForTransport } from "./core.js";
 import { DEFAULT_PORT, readBridgeState } from "./runtime.js";
@@ -8,7 +9,11 @@ const bridge = new LocalWebBridge();
 installWebBridge(bridge);
 applyWebCommandContributors(bridge);
 
-type ToolPath = { path: string; toolName: string };
+type ToolPath = { path: string; toolName: string; before?: string };
+
+const MAX_PREVIEW_FILE_CHARS = 512 * 1024;
+const PREVIEW_EXTENSIONS = new Set([".md", ".txt", ".go", ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".py", ".rb", ".rs", ".java", ".kt", ".sh", ".bash", ".zsh", ".fish", ".sql", ".html", ".css", ".scss", ".xml", ".dockerfile"]);
+const PREVIEW_BASENAMES = new Set(["makefile", "dockerfile", "cmakelists.txt", ".gitignore", ".dockerignore", ".editorconfig"]);
 const EVENT_MAX_CHARS = 64 * 1024;
 
 function plain(value: unknown, maxChars = EVENT_MAX_CHARS): unknown { return compactForTransport(value, maxChars); }
@@ -47,11 +52,21 @@ function metadata(pi: ExtensionAPI, ctx: ExtensionContext): AgentMetadata {
 	};
 }
 
-function pathFromArgs(cwd: string, value: unknown): string | undefined {
+function previewPathFromArgs(cwd: string, value: unknown): string | undefined {
 	if (!value || typeof value !== "object") return undefined;
 	const raw = (value as { path?: unknown }).path;
-	if (typeof raw !== "string" || !raw.toLowerCase().endsWith(".md")) return undefined;
-	return isAbsolute(raw) ? resolve(raw) : resolve(cwd, raw.startsWith("@") ? raw.slice(1) : raw);
+	if (typeof raw !== "string") return undefined;
+	const path = isAbsolute(raw) ? resolve(raw) : resolve(cwd, raw.startsWith("@") ? raw.slice(1) : raw);
+	return PREVIEW_EXTENSIONS.has(extname(path).toLowerCase()) || PREVIEW_BASENAMES.has(basename(path).toLowerCase()) ? path : undefined;
+}
+
+async function previousFileContent(path: string): Promise<string | undefined> {
+	try {
+		const source = await readFile(path, "utf8");
+		return source.length <= MAX_PREVIEW_FILE_CHARS && !source.includes("\0") ? source : undefined;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ENOENT" ? "" : undefined;
+	}
 }
 
 export default function (pi: ExtensionAPI) {
@@ -133,8 +148,8 @@ export default function (pi: ExtensionAPI) {
 	pi.on("tool_execution_start", async (event, ctx) => {
 		current = ctx;
 		const value = event as unknown as { toolCallId: string; toolName: string; args: unknown };
-		const path = (value.toolName === "write" || value.toolName === "edit") ? pathFromArgs(ctx.cwd, value.args) : undefined;
-		if (path) writePaths.set(value.toolCallId, { path, toolName: value.toolName });
+		const path = (value.toolName === "write" || value.toolName === "edit") ? previewPathFromArgs(ctx.cwd, value.args) : undefined;
+		if (path) writePaths.set(value.toolCallId, { path, toolName: value.toolName, before: await previousFileContent(path) });
 		if (enabled) bridge.emit("tool_start", { toolCallId: value.toolCallId, toolName: value.toolName, args: plain(value.args) as Record<string, unknown> });
 	});
 	pi.on("tool_execution_update", async (event, ctx) => { current = ctx; if (enabled) { const value = event as unknown as { toolCallId: string; toolName: string; partialResult: unknown }; bridge.emit("tool_update", { toolCallId: value.toolCallId, toolName: value.toolName, result: plain(value.partialResult) as Record<string, unknown> }); } });
@@ -143,6 +158,6 @@ export default function (pi: ExtensionAPI) {
 		const value = event as unknown as { toolCallId: string; toolName: string; result: unknown; isError: boolean };
 		if (enabled) bridge.emit("tool_end", { toolCallId: value.toolCallId, toolName: value.toolName, result: plain(value.result) as Record<string, unknown>, isError: value.isError });
 		const changed = writePaths.get(value.toolCallId); writePaths.delete(value.toolCallId);
-		if (enabled && changed && !value.isError) bridge.emit("markdown_changed", { path: changed.path, toolName: changed.toolName });
+		if (enabled && changed && !value.isError) bridge.emit("file_changed", { path: changed.path, toolName: changed.toolName, before: changed.before, diffAvailable: changed.before !== undefined });
 	});
 }

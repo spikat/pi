@@ -75,7 +75,7 @@ test("HTTPS bridge authenticates the browser and relays agent state", async () =
 		const health = await get({ hostname: "127.0.0.1", port, path: "/health", rejectUnauthorized: false, headers: { "x-pi-web-agent-token": state.agentToken } });
 		assert.equal(health.status, 204);
 		const page = await get({ hostname: "localhost", port, path: `/?token=${state.browserToken}`, rejectUnauthorized: false });
-		assert.equal(page.status, 200); assert.match(page.body, /Show agent reasoning/); assert.match(page.body, /Desktop notifications/); assert.match(page.body, /Mute agent notifications/); assert.match(page.body, /Drop queued prompts/); assert.match(page.body, /Copy this agent message to the clipboard/); assert.match(page.body, /navigator\.clipboard\?\.writeText/); assert.match(page.body, /appendDocumentReferences/); assert.match(page.body, /isTableDivider/); assert.match(page.body, /appendDialogs\(messages,agent\)/); assert.match(page.body, /showThinking=false,showTools=false/); assert.match(page.body, /Validate current selection/); assert.match(page.body, /Enter a prompt for the assistant/);
+		assert.equal(page.status, 200); assert.match(page.body, /Show agent reasoning/); assert.match(page.body, /Desktop notifications/); assert.match(page.body, /Mute agent notifications/); assert.match(page.body, /Drop queued prompts/); assert.match(page.body, /Copy this agent message to the clipboard/); assert.match(page.body, /navigator\.clipboard\?\.writeText/); assert.match(page.body, /appendFileReferences/); assert.match(page.body, /fileViewer/); assert.match(page.body, /diffRows/); assert.match(page.body, /isTableDivider/); assert.match(page.body, /appendDialogs\(messages,agent\)/); assert.match(page.body, /showThinking=false,showTools=false/); assert.match(page.body, /Validate current selection/); assert.match(page.body, /Enter a prompt for the assistant/);
 		const clientScript = /<script>([\s\S]*?)<\/script>/.exec(page.body)?.[1]; assert.ok(clientScript); assert.doesNotThrow(() => new Function(clientScript));
 		const cookie = page.headers["set-cookie"]?.toString().split(";")[0]; assert.ok(cookie);
 		const browser = await open(`wss://localhost:${port}/ws`, { rejectUnauthorized: false, headers: { cookie, origin: `https://localhost:${port}` } });
@@ -89,6 +89,15 @@ test("HTTPS bridge authenticates the browser and relays agent state", async () =
 		const queued = await nextMessage(browser); assert.equal(queued.type, "agent_event"); assert.equal(((queued.event as { pending: number }).pending), 2);
 		const preview = await get({ hostname: "localhost", port, path: "/markdown?agent=agent-1&path=format.md", rejectUnauthorized: false, headers: { cookie } });
 		assert.equal(preview.status, 200); assert.match(preview.body, /<table>/); assert.match(preview.body, /<strong>bold<\/strong>/); assert.match(preview.body, /<code>code<\/code>/); assert.match(preview.body, /<blockquote>/); assert.match(preview.body, /<pre><code>&gt; literal Markdown\nREADME\.md<\/code><\/pre>/);
+		await writeFile(join(runtime, "example.go"), "package main\n\nfunc main() { println(\"new\") }\n");
+		agent.send(JSON.stringify({ type: "agent_event", event: { type: "file_changed", path: join(runtime, "example.go"), before: "package main\n\nfunc main() { println(\"old\") }\n", diffAvailable: true } }));
+		const changed = await nextMessage(browser); assert.equal(changed.type, "agent_event"); assert.equal((changed.event as { type: string }).type, "file_changed"); assert.equal(Object.hasOwn(changed.event as object, "before"), false);
+		const file = await get({ hostname: "localhost", port, path: "/file?agent=agent-1&path=example.go", rejectUnauthorized: false, headers: { cookie } });
+		assert.equal(file.status, 200); assert.deepEqual(JSON.parse(file.body), { path: join(runtime, "example.go"), language: "go", mode: "file", content: "package main\n\nfunc main() { println(\"new\") }\n" });
+		const diff = await get({ hostname: "localhost", port, path: "/file?agent=agent-1&path=example.go&mode=diff", rejectUnauthorized: false, headers: { cookie } });
+		assert.equal(diff.status, 200); assert.equal(JSON.parse(diff.body).before, "package main\n\nfunc main() { println(\"old\") }\n");
+		const escapedFile = await get({ hostname: "localhost", port, path: "/file?agent=agent-1&path=../outside.go", rejectUnauthorized: false, headers: { cookie } });
+		assert.equal(escapedFile.status, 404);
 		browser.send(JSON.stringify({ type: "input", agentId: "agent-1", text: "queued browser prompt" }));
 		assert.deepEqual(await nextMessage(agent), { type: "input", text: "queued browser prompt" });
 		browser.send(JSON.stringify({ type: "clear_queue", agentId: "agent-1" }));
