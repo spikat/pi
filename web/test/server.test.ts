@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { X509Certificate } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer as createNetServer } from "node:net";
 import { request } from "node:https";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import selfsigned from "selfsigned";
 import WebSocket from "ws";
 
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -28,6 +30,20 @@ function get(options: Parameters<typeof request>[1]): Promise<{ status: number; 
 }
 function nextMessage(socket: WebSocket): Promise<Record<string, unknown>> { return new Promise((resolve) => socket.once("message", (value) => resolve(JSON.parse(String(value)) as Record<string, unknown>))); }
 function open(url: string, options: WebSocket.ClientOptions): Promise<WebSocket> { return new Promise((resolve, reject) => { const socket = new WebSocket(url, options); socket.once("open", () => resolve(socket)); socket.once("error", reject); }); }
+
+test("HTTPS bridge renews certificates that are close to expiry", async () => {
+	const runtime = await mkdtemp(join(tmpdir(), "pi-web-")); const port = await freePort();
+	const expiring = selfsigned.generate([{ name: "commonName", value: "localhost" }], { days: 1, keySize: 2048 });
+	await writeFile(join(runtime, "localhost-key.pem"), expiring.private);
+	await writeFile(join(runtime, "localhost-cert.pem"), expiring.cert);
+	const child = spawn(process.execPath, [join(process.cwd(), "server.mjs")], { cwd: join(process.cwd()), env: { ...process.env, PI_WEB_RUNTIME_DIR: runtime, PI_WEB_PORT: String(port) }, stdio: "ignore" });
+	try {
+		await eventually(async () => { try { return JSON.parse(await readFile(join(runtime, "bridge.json"), "utf8")) as Record<string, unknown>; } catch { return undefined; } });
+		const renewed = await readFile(join(runtime, "localhost-cert.pem"), "utf8");
+		assert.notEqual(renewed, expiring.cert);
+		assert.ok(Date.parse(new X509Certificate(renewed).validTo) > Date.now() + 300 * 24 * 60 * 60 * 1000);
+	} finally { child.kill("SIGTERM"); await rm(runtime, { recursive: true, force: true }); }
+});
 
 test("HTTPS bridge authenticates the browser and relays agent state", async () => {
 	const runtime = await mkdtemp(join(tmpdir(), "pi-web-")); const port = await freePort();

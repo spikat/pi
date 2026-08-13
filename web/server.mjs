@@ -1,7 +1,6 @@
 import { createServer } from "node:https";
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes, timingSafeEqual, X509Certificate } from "node:crypto";
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import selfsigned from "selfsigned";
 import { WebSocketServer, WebSocket } from "ws";
@@ -13,6 +12,8 @@ const keyFile = join(runtime, "localhost-key.pem");
 const certFile = join(runtime, "localhost-cert.pem");
 const agents = new Map();
 const browsers = new Set();
+const CERTIFICATE_DAYS = 365;
+const RENEW_CERTIFICATE_BEFORE_MS = 7 * 24 * 60 * 60 * 1000;
 let idleTimer;
 
 const token = () => randomBytes(32).toString("base64url");
@@ -28,10 +29,24 @@ const browserAuthorised = (request, state) => equal(cookies(request).pi_web_sess
 const agentAuthorised = (request, state) => equal(request.headers["x-pi-web-agent-token"], state.agentToken);
 
 async function privateWrite(path, content) { await writeFile(path, content, { mode: 0o600 }); await chmod(path, 0o600); }
+function certificateNeedsRenewal(cert) {
+  try {
+    const parsed = new X509Certificate(cert);
+    const validFrom = Date.parse(parsed.validFrom);
+    const validTo = Date.parse(parsed.validTo);
+    const now = Date.now();
+    return !Number.isFinite(validFrom) || !Number.isFinite(validTo) || validFrom > now || validTo <= now + RENEW_CERTIFICATE_BEFORE_MS;
+  } catch { return true; }
+}
 async function startFiles() {
   await mkdir(runtime, { recursive: true, mode: 0o700 }); await chmod(runtime, 0o700);
-  if (!existsSync(keyFile) || !existsSync(certFile)) {
-    const pems = selfsigned.generate([{ name: "commonName", value: "localhost" }], { days: 7, keySize: 2048, extensions: [{ name: "subjectAltName", altNames: [{ type: 2, value: "localhost" }, { type: 7, ip: "127.0.0.1" }] }] });
+  let renew = false;
+  try {
+    const [key, cert] = await Promise.all([readFile(keyFile), readFile(certFile)]);
+    renew = !key.length || certificateNeedsRenewal(cert);
+  } catch { renew = true; }
+  if (renew) {
+    const pems = selfsigned.generate([{ name: "commonName", value: "localhost" }], { days: CERTIFICATE_DAYS, keySize: 2048, extensions: [{ name: "subjectAltName", altNames: [{ type: 2, value: "localhost" }, { type: 7, ip: "127.0.0.1" }] }] });
     await privateWrite(keyFile, pems.private); await privateWrite(certFile, pems.cert);
   }
   return { key: await readFile(keyFile), cert: await readFile(certFile) };
