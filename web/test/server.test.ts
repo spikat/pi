@@ -80,6 +80,7 @@ test("HTTPS bridge authenticates the browser and relays agent state", async () =
 		assert.equal(health.status, 204);
 		const page = await get({ hostname: "localhost", port, path: `/?token=${state.browserToken}`, rejectUnauthorized: false });
 		assert.equal(page.status, 200); assert.match(page.body, /Show agent reasoning/); assert.match(page.body, /Desktop notifications/); assert.match(page.body, /Mute agent notifications/); assert.match(page.body, /Drop queued prompts/); assert.match(page.body, /Copy this agent message to the clipboard/); assert.match(page.body, /navigator\.clipboard\?\.writeText/); assert.match(page.body, /appendFileReferences/); assert.match(page.body, /fileViewer/); assert.match(page.body, /View source/); assert.match(page.body, /\.file-viewer>\.markdown\{box-sizing:border-box;padding:\.45rem \.8rem \.8rem\}/); assert.match(page.body, /focusFirstChange:true/); assert.match(page.body, /title:'Previous change'/); assert.match(page.body, /title:'Next change'/); assert.match(page.body, /scrollToDiffChange/); assert.match(page.body, /language==='python'/); assert.match(page.body, /syntax-target/); assert.match(page.body, /gitDiffRows/); assert.match(page.body, /isTableDivider/); assert.match(page.body, /appendDialogs\(messages,agent\)/); assert.match(page.body, /showThinking=false,showTools=false/); assert.match(page.body, /Validate current selection/); assert.match(page.body, /Enter a prompt for the assistant/);
+		assert.match(page.body, /fileAvailability=new Map/); assert.match(page.body, /function previewAvailability/); assert.match(page.body, /&check=1/); assert.match(page.body, /Close file view/); assert.match(page.body, /event\.key==='Escape'/);
 		const clientScript = /<script>([\s\S]*?)<\/script>/.exec(page.body)?.[1]; assert.ok(clientScript); assert.doesNotThrow(() => new Function(clientScript));
 		const cookie = page.headers["set-cookie"]?.toString().split(";")[0]; assert.ok(cookie);
 		const browser = await open(`wss://localhost:${port}/ws`, { rejectUnauthorized: false, headers: { cookie, origin: `https://localhost:${port}` } });
@@ -95,6 +96,8 @@ test("HTTPS bridge authenticates the browser and relays agent state", async () =
 		assert.equal(preview.status, 200); assert.match(preview.body, /<table>/); assert.match(preview.body, /<strong>bold<\/strong>/); assert.match(preview.body, /<code>code<\/code>/); assert.match(preview.body, /<blockquote>/); assert.match(preview.body, /<pre><code>&gt; literal Markdown\nREADME\.md<\/code><\/pre>/);
 		const markdownFile = await get({ hostname: "localhost", port, path: "/file?agent=agent-1&path=format.md", rejectUnauthorized: false, headers: { cookie } });
 		assert.equal(JSON.parse(markdownFile.body).language, "markdown");
+		const previewableCheck = await get({ hostname: "localhost", port, path: "/file?agent=agent-1&path=format.md&check=1", rejectUnauthorized: false, headers: { cookie } });
+		assert.equal(previewableCheck.status, 204); assert.equal(previewableCheck.body, "");
 		const originalGo = "package main\n\nfunc main() { println(\"old\") }\n";
 		await writeFile(join(runtime, "example.go"), originalGo); await git(runtime, ["add", "--", "example.go"]);
 		await writeFile(join(runtime, "example.go"), "package main\n\nfunc main() { println(\"new\") }\n");
@@ -107,7 +110,8 @@ test("HTTPS bridge authenticates the browser and relays agent state", async () =
 		const untrackedDiff = await get({ hostname: "localhost", port, path: "/file?agent=agent-1&path=format.md&mode=diff", rejectUnauthorized: false, headers: { cookie } });
 		assert.equal(untrackedDiff.status, 404);
 		const escapedFile = await get({ hostname: "localhost", port, path: "/file?agent=agent-1&path=../outside.go", rejectUnauthorized: false, headers: { cookie } });
-		assert.equal(escapedFile.status, 404);
+		const escapedCheck = await get({ hostname: "localhost", port, path: "/file?agent=agent-1&path=../outside.go&check=1", rejectUnauthorized: false, headers: { cookie } });
+		assert.equal(escapedFile.status, 404); assert.equal(escapedCheck.status, 404);
 		const outside = await mkdtemp(join(tmpdir(), "pi-web-outside-"));
 		try {
 			const secret = join(outside, "secret.md");
@@ -121,8 +125,12 @@ test("HTTPS bridge authenticates the browser and relays agent state", async () =
 		await writeFile(join(runtime, "oversized.md"), "x".repeat(512 * 1024 + 1));
 		const oversizedFile = await get({ hostname: "localhost", port, path: "/file?agent=agent-1&path=oversized.md", rejectUnauthorized: false, headers: { cookie } });
 		const oversizedMarkdown = await get({ hostname: "localhost", port, path: "/markdown?agent=agent-1&path=oversized.md", rejectUnauthorized: false, headers: { cookie } });
+		const oversizedCheck = await get({ hostname: "localhost", port, path: "/file?agent=agent-1&path=oversized.md&check=1", rejectUnauthorized: false, headers: { cookie } });
 		assert.equal(oversizedFile.status, 404);
-		assert.equal(oversizedMarkdown.status, 404);
+		assert.equal(oversizedMarkdown.status, 404); assert.equal(oversizedCheck.status, 404);
+		await writeFile(join(runtime, "binary.go"), Buffer.from([0, 1, 2]));
+		const binaryCheck = await get({ hostname: "localhost", port, path: "/file?agent=agent-1&path=binary.go&check=1", rejectUnauthorized: false, headers: { cookie } });
+		assert.equal(binaryCheck.status, 404);
 		const fifo = join(runtime, "preview.fifo.md");
 		await execFileAsync("mkfifo", [fifo]);
 		const specialFile = await get({ hostname: "localhost", port, path: "/file?agent=agent-1&path=preview.fifo.md", rejectUnauthorized: false, headers: { cookie } });
