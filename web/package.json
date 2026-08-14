@@ -1,6 +1,6 @@
 {
   "name": "@spikat/pi-web",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Local HTTPS bridge and live web dashboard for Pi sessions",
   "license": "MIT",
   "type": "module",
