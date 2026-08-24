@@ -197,11 +197,12 @@ function shellCContent(words: string[]): string | undefined {
 	const content = words[flag + 1];
 	if (!content) return undefined;
 	const executable = words[0]?.split("/").at(-1) ?? "";
-	// Do not mistake ordinary command flags such as `wc -c file.html` for
-	// shell execution. Known shells always qualify; unknown/custom shells are
-	// accepted when their -c payload visibly contains shell program syntax.
+	// Do not mistake ordinary command flags such as `wc -c file.html` or
+	// `stat -c '%a %U:%G %n'` for shell execution. Known shells always
+	// qualify; an unknown/custom executable needs unambiguous shell syntax in
+	// its payload. Whitespace alone is ordinary command data, not shell syntax.
 	const knownShell = /(?:^|[-_.])(ba|z|da|k|mk|tc)?sh$|^(?:bash|zsh|dash|fish|shell)$/i.test(executable);
-	const shellProgram = /[|;&(){}$`\n]/.test(content) || /\s/.test(content);
+	const shellProgram = /[|;&(){}$`\n]/.test(content);
 	return knownShell || shellProgram ? content : undefined;
 }
 

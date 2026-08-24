@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
-import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { Key, matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { existsSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { analyseShell, classification, loadStore, matchesRule, normalizeRule, ruleFor, saveStore, type CommandPart, type RuleState, type Store } from "./core.js";
@@ -74,15 +74,18 @@ async function showGate(ctx: ExtensionContext, choices: Choice[], global?: strin
 		const finish = (answer: GateResult) => { if (settled) return; settled = true; remote?.resolve(webGateResult(answer, choices)); done(answer); resolve(answer); };
 		if (remote) remoteResult().then(finish).catch(() => undefined);
 		const render = (width: number): string[] => {
-			if (help) return detailedHelp().map((line) => truncateToWidth(line, width));
+			// Commands are security decisions: wrap them rather than hiding their
+			// trailing arguments behind an ellipsis.
+			const wrap = (line: string) => wrapTextWithAnsi(line, Math.max(1, width));
+			if (help) return detailedHelp().flatMap(wrap);
 			const lines = [theme.fg("accent", theme.bold("Review shell command"))];
-			if (global) lines.push(truncateToWidth(theme.fg("dim", `Original: ${global}`), width));
-			for (let i = 0; i < choices.length; i++) { const c = choices[i]!; const label = `${marker(c.state)} ${ruleFor(c.part, c.args)}${c.part.pythonScript ? " (one time only)" : ""}`; const row = `${i === selected ? "› " : "  "}${label}`; lines.push(truncateToWidth(i === selected ? theme.bg("selectedBg", theme.fg("accent", row)) : row, width)); }
+			if (global) lines.push(...wrap(theme.fg("dim", `Original: ${global}`)));
+			for (let i = 0; i < choices.length; i++) { const c = choices[i]!; const label = `${marker(c.state)} ${ruleFor(c.part, c.args)}${c.part.pythonScript ? " (one time only)" : ""}`; const row = `${i === selected ? "› " : "  "}${label}`; lines.push(...wrap(i === selected ? theme.bg("selectedBg", theme.fg("accent", row)) : row)); }
 			const validate = `${selected === validateIndex ? "› " : "  "}Validate current selection`;
-			lines.push(theme.bg(selected === validateIndex ? "selectedBg" : "toolPendingBg", truncateToWidth(validate, width)));
+			lines.push(...wrap(theme.bg(selected === validateIndex ? "selectedBg" : "toolPendingBg", validate)));
 			const input = prompt.render(selected === promptIndex);
-			lines.push(selected === promptIndex ? theme.bg("selectedBg", truncateToWidth(input, width)) : truncateToWidth(input, width));
-			lines.push(theme.fg("dim", footer())); return lines;
+			lines.push(...wrap(selected === promptIndex ? theme.bg("selectedBg", input) : input));
+			lines.push(...wrap(theme.fg("dim", footer()))); return lines;
 		};
 		return { invalidate() {}, render, handleInput(data: string) {
 			if (help) { if (matchesKey(data, Key.escape)) { help = false; tui.requestRender(); } return; }

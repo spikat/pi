@@ -23,11 +23,12 @@ test("recurses through shell -c and process substitutions", () => {
   assert.deepEqual(process.parts.map((p) => p.displayWords.join(" ")), ["diff <(sort file1) <(sort file2) *", "sort file1 *", "sort file2 *"]);
 });
 
-test("does not mistake wc -c for a shell -c invocation", () => {
-  const result = analyseShell("git diff --check && wc -c comparatif.html && rg -n 'foo|bar' comparatif.html");
+test("does not mistake ordinary -c flags for shell invocations", () => {
+  const result = analyseShell("git diff --check && wc -c comparatif.html && stat -c '%a %U:%G %n' Dockerfile Makefile && rg -n 'foo|bar' comparatif.html");
   assert.deepEqual(result.parts.map((part) => part.displayWords.join(" ")), [
     "git diff --check *",
     "wc -c comparatif.html *",
+    "stat -c %a %U:%G %n Dockerfile Makefile *",
     "rg -n foo|bar comparatif.html *",
   ]);
 });
