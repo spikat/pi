@@ -33,6 +33,20 @@ test("does not mistake ordinary -c flags for shell invocations", () => {
   ]);
 });
 
+test("does not parse ripgrep count-pattern alternatives as subcommands", () => {
+  const result = analyseShell(`cd ../.. && printf '%s\\n' '--- exact warning counts ---'; for f in access-server_australia-southeas/logs/system-probe.log*; do echo "$f"; rg -i -c 'SSH_CLIENT|ssh session|not resolved|failed to sent event|retry|queue' "$f" || true; done; printf '%s\\n' '--- samples ---'; rg -n -i 'SSH_CLIENT|ssh session|not resolved|failed to sent event|retry|queue' access-server_australia-southeas/logs/system-probe.log* | head -100`);
+  assert.deepEqual(result.parts.map((part) => part.displayWords.join(" ")), [
+    "cd ../.. *",
+    "printf %s\\n --- exact warning counts --- *",
+    "echo *",
+    "rg -i -c SSH_CLIENT|ssh session|not resolved|failed to sent event|retry|queue *",
+    "true *",
+    "printf %s\\n --- samples --- *",
+    "rg -n -i SSH_CLIENT|ssh session|not resolved|failed to sent event|retry|queue access-server_australia-southeas/logs/system-probe.log* *",
+    "head -100 *",
+  ]);
+});
+
 test("keeps process substitutions as arguments while analyzing their contents", () => {
   const result = analyseShell("probe=$(comm -13 <(printf '%s\\n' $oldpids | sort -n) <(pgrep -x xclip | sort -n) | tail -1)");
   assert.deepEqual(result.parts.map((part) => part.displayWords.join(" ")), [
