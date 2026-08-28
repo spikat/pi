@@ -3,7 +3,7 @@ import test from "node:test";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { analyseShell, classification, EMPTY_STORE, loadStore, matchesRule, normalizeRule, ruleFor, saveStore } from "../core.js";
+import { analyseShell, classification, EMPTY_STORE, loadStore, matchesRule, normalizeRule, resolveRule, ruleFor, saveStore } from "../core.js";
 
 test("splits pipelines and ignores redirections", () => {
   const result = analyseShell('find /path -name "*.go"|grep -v test|sort|xargs grep -i func 2>/dev/null|uniq -c|wc -l');
@@ -190,6 +190,35 @@ test("rules are prefix matches and blacklist wins", () => {
   assert.equal(ruleFor(part, 0), "ls *");
   assert.equal(normalizeRule("ls foo"), "ls foo *");
   assert.equal(normalizeRule("ls * foo"), undefined);
+});
+
+test("merges global and project rules while giving every deny priority", () => {
+	const part = analyseShell("git push origin main").parts[0]!;
+	assert.deepEqual(resolveRule(
+		{ ...EMPTY_STORE, whitelist: ["git push *"] },
+		{ ...EMPTY_STORE, blacklist: ["git push origin main *"] },
+		part,
+	), { scope: "project", state: "deny", rule: "git push origin main *" });
+	assert.deepEqual(resolveRule(
+		{ ...EMPTY_STORE, blacklist: ["git push *"] },
+		{ ...EMPTY_STORE, whitelist: ["git push origin main *"] },
+		part,
+	), { scope: "global", state: "deny", rule: "git push *" });
+	assert.deepEqual(resolveRule(
+		{ ...EMPTY_STORE, whitelist: ["git *"] },
+		{ ...EMPTY_STORE, whitelist: ["git push origin *"] },
+		part,
+	), { scope: "project", state: "allow", rule: "git push origin *" });
+});
+
+test("global configuration stores only command rules", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "cw-global-")); const file = join(dir, "config.json");
+	await saveStore(file, { ...EMPTY_STORE, whitelist: ["ls *"], editDirectories: ["/must-not-persist"] }, "global");
+	assert.deepEqual(JSON.parse(await readFile(file, "utf8")), { version: 2, whitelist: ["ls *"], blacklist: [] });
+	assert.deepEqual(await loadStore(file, "global"), { ...EMPTY_STORE, whitelist: ["ls *"] });
+	await writeFile(file, JSON.stringify({ version: 2, whitelist: [], blacklist: [] }));
+	assert.deepEqual(await loadStore(file, "global"), EMPTY_STORE);
+	await assert.rejects(() => loadStore(file, "project"), /unsupported or malformed/);
 });
 
 test("version migration, malformed config and atomic persistence", async () => {

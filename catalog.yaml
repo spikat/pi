@@ -20,6 +20,11 @@ extensions:
     command: /whitelist
     description: Review shell and file-edit actions and persist allow or deny rules.
 
+  - id: ask
+    path: ./ask
+    command: /ask <prompt>
+    description: Ask a question with read-only project inspection and no file changes.
+
   - id: web
     path: ./web
     command: /web on

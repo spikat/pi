@@ -1,27 +1,30 @@
 {
-  "name": "@spikat/pi-review",
-  "version": "1.2.0",
-  "description": "Review committed branch and staged Git changes in Pi",
+  "name": "@spikat/pi-ask",
+  "version": "1.0.0",
+  "description": "Ask Pi a question while preventing file modifications",
   "license": "MIT",
   "type": "module",
   "keywords": [
     "pi-package",
     "pi",
     "pi-extension",
-    "git",
-    "code-review"
+    "read-only",
+    "ask"
   ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/spikat/pi.git",
-    "directory": "review"
+    "directory": "ask"
   },
   "files": [
     "index.ts",
     "README.md",
-    "LICENSE",
-    "skills"
+    "LICENSE"
   ],
+  "scripts": {
+    "test": "tsx --test test/**/*.test.ts",
+    "check": "tsc --noEmit"
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },
@@ -32,5 +35,10 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.3"
   }
 }

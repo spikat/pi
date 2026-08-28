@@ -6,6 +6,8 @@ export const CONFIG_VERSION = 2 as const;
 export type Store = { version: 2; whitelist: string[]; blacklist: string[]; editDirectories: string[]; editFiles: string[] };
 export const EMPTY_STORE: Store = { version: CONFIG_VERSION, whitelist: [], blacklist: [], editDirectories: [], editFiles: [] };
 export type RuleState = "undecided" | "allow" | "deny";
+export type RuleScope = "global" | "project";
+export type ResolvedRule = { scope: RuleScope; state: "allow" | "deny"; rule: string };
 export type CommandPart = { original: string; words: string[]; displayWords: string[]; dynamic: boolean; unsupported?: boolean; pythonScript?: boolean };
 
 const CONTROL_WORDS = new Set(["then", "else", "elif", "fi", "do", "done", "in", "case", "esac", "{"]);
@@ -273,19 +275,45 @@ export function matchesRule(rule: string, part: CommandPart): boolean {
 	return ruleWords.slice(0, -1).every((word, index) => actual[index] === word);
 }
 
+/** Returns the most specific matching rule from a single allow/deny list. */
+export function matchingRule(rules: string[], part: CommandPart): string | undefined {
+	return rules
+		.filter((rule) => matchesRule(rule, part))
+		.sort((left, right) => right.split(" ").length - left.split(" ").length || left.localeCompare(right))[0];
+}
+
 export function classification(store: Store, part: CommandPart): RuleState {
-	if (store.blacklist.some((rule) => matchesRule(rule, part))) return "deny";
-	if (store.whitelist.some((rule) => matchesRule(rule, part))) return "allow";
+	if (matchingRule(store.blacklist, part)) return "deny";
+	if (matchingRule(store.whitelist, part)) return "allow";
 	return "undecided";
 }
 
-function isStore(value: unknown): value is Store {
-	if (!value || typeof value !== "object") return false;
-	const s = value as Record<string, unknown>;
-	return s.version === 2 && ["whitelist", "blacklist", "editDirectories", "editFiles"].every((key) => Array.isArray(s[key]) && (s[key] as unknown[]).every((item) => typeof item === "string"));
+/**
+ * Resolves command rules from both scopes. A matching deny always wins; within
+ * a decision, project rules are reported before global rules.
+ */
+export function resolveRule(global: Store, project: Store, part: CommandPart): ResolvedRule | undefined {
+	for (const [scope, state, rules] of [
+		["project", "deny", project.blacklist],
+		["global", "deny", global.blacklist],
+		["project", "allow", project.whitelist],
+		["global", "allow", global.whitelist],
+	] as const) {
+		const rule = matchingRule(rules, part);
+		if (rule) return { scope, state, rule };
+	}
+	return undefined;
 }
 
-export async function loadStore(path: string): Promise<Store> {
+function isStore(value: unknown, scope: RuleScope): value is Store {
+	if (!value || typeof value !== "object") return false;
+	const store = value as Record<string, unknown>;
+	const commandLists = ["whitelist", "blacklist"].every((key) => Array.isArray(store[key]) && (store[key] as unknown[]).every((item) => typeof item === "string"));
+	const editLists = ["editDirectories", "editFiles"].every((key) => Array.isArray(store[key]) && (store[key] as unknown[]).every((item) => typeof item === "string"));
+	return store.version === 2 && commandLists && (scope === "global" || editLists);
+}
+
+export async function loadStore(path: string, scope: RuleScope = "project"): Promise<Store> {
 	if (!existsSync(path)) return { ...EMPTY_STORE, whitelist: [], blacklist: [], editDirectories: [], editFiles: [] };
 	const raw = await readFile(path, "utf8");
 	let value: unknown;
@@ -293,15 +321,16 @@ export async function loadStore(path: string): Promise<Store> {
 	if (value && typeof value === "object" && !("version" in value)) { await rm(path); return { ...EMPTY_STORE, whitelist: [], blacklist: [], editDirectories: [], editFiles: [] }; }
 	const version = value && typeof value === "object" ? (value as { version?: unknown }).version : undefined;
 	if (typeof version === "number" && version < CONFIG_VERSION) { await rm(path); return { ...EMPTY_STORE, whitelist: [], blacklist: [], editDirectories: [], editFiles: [] }; }
-	if (!isStore(value)) throw new Error(`commands whitelist: unsupported or malformed configuration in ${path}`);
-	return { ...value, whitelist: [...new Set(value.whitelist)], blacklist: [...new Set(value.blacklist)], editDirectories: [...new Set(value.editDirectories)], editFiles: [...new Set(value.editFiles)] };
+	if (!isStore(value, scope)) throw new Error(`commands whitelist: unsupported or malformed configuration in ${path}`);
+	return { ...value, whitelist: [...new Set(value.whitelist)], blacklist: [...new Set(value.blacklist)], editDirectories: scope === "global" ? [] : [...new Set(value.editDirectories)], editFiles: scope === "global" ? [] : [...new Set(value.editFiles)] };
 }
 
-export async function saveStore(path: string, store: Store): Promise<void> {
+export async function saveStore(path: string, store: Store, scope: RuleScope = "project"): Promise<void> {
 	const normalized: Store = { version: 2, whitelist: [...new Set(store.whitelist)], blacklist: [...new Set(store.blacklist)], editDirectories: [...new Set(store.editDirectories)], editFiles: [...new Set(store.editFiles)] };
 	if (normalized.whitelist.some((r) => normalized.blacklist.includes(r))) throw new Error("commands whitelist: identical whitelist and blacklist rule");
 	await mkdir(dirname(path), { recursive: true });
 	const temp = `${path}.${process.pid}.${Date.now()}.tmp`;
-	await writeFile(temp, `${JSON.stringify(normalized, null, 2)}\n`, "utf8");
+	const serializable = scope === "global" ? { version: normalized.version, whitelist: normalized.whitelist, blacklist: normalized.blacklist } : normalized;
+	await writeFile(temp, `${JSON.stringify(serializable, null, 2)}\n`, "utf8");
 	await rename(temp, path);
 }

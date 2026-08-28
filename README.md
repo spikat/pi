@@ -9,7 +9,8 @@ A collection of personal extensions for [Pi](https://www.npmjs.com/package/@eare
 | [`commit-msg`](./commit-msg) | `/gen-commit-msg` | Generates an English commit message from staged changes. |
 | [`pr-description`](./pr-description) | `/gen-pr-desc` | Generates a markdown pull request description from the current branch commits. |
 | [`review`](./review) | `/review` | Runs a code review on the branch and offers to apply fixes finding by finding. |
-| [`commands-whitelist`](./commands-whitelist) | `/whitelist` | Asks for confirmation before assistant actions and persists whitelisted commands. |
+| [`commands-whitelist`](./commands-whitelist) | `/whitelist` | Asks for confirmation before assistant actions and persists project or user-global command rules. |
+| [`ask`](./ask) | `/ask <prompt>` | Answers a question with read-only project inspection and no file changes. |
 | [`web`](./web) | `/web on` | Connects Pi sessions to a local HTTPS live dashboard. |
 
 ## Install from npm
@@ -21,6 +22,7 @@ pi install npm:@spikat/pi-commit-msg
 pi install npm:@spikat/pi-pr-description
 pi install npm:@spikat/pi-review
 pi install npm:@spikat/pi-commands-whitelist
+pi install npm:@spikat/pi-ask
 pi install npm:@spikat/pi-web
 ```
 
@@ -41,6 +43,7 @@ pi -e ./commit-msg
 pi -e ./pr-description
 pi -e ./review
 pi -e ./commands-whitelist
+pi -e ./ask
 pi -e ./web
 ```
 
@@ -62,6 +65,7 @@ Each extension has its own README:
 - [`pr-description/README.md`](./pr-description/README.md)
 - [`review/README.md`](./review/README.md)
 - [`commands-whitelist/README.md`](./commands-whitelist/README.md)
+- [`ask/README.md`](./ask/README.md)
 - [`web/README.md`](./web/README.md)
 
 ## License
