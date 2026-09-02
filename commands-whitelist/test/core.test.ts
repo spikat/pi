@@ -16,6 +16,20 @@ test("honours quotes and escaped separators", () => {
   assert.deepEqual(result.parts.map((p) => p.displayWords.join(" ")), ["grep foo|bar file *", "echo foo|bar *", "sort *"]);
 });
 
+test("does not expose comments between commands as subcommands", () => {
+  const result = analyseShell(`git ls-tree -r --name-only HEAD pkg/security/probe/procfs | head -100
+# Retrieve actual source locations of procfs definitions from HEAD only.
+for f in $(git grep -l 'func OpenMem\\|type Mem\\|func ParseMapsLine' HEAD -- pkg/security); do
+  git show "$f"
+done`);
+  assert.deepEqual(result.parts.map((part) => part.displayWords.join(" ")), [
+    "git ls-tree -r --name-only HEAD pkg/security/probe/procfs *",
+    "head -100 *",
+    "git grep -l func OpenMem\\|type Mem\\|func ParseMapsLine HEAD -- pkg/security *",
+    "git show *",
+  ]);
+});
+
 test("recurses through shell -c and process substitutions", () => {
   const shell = analyseShell('sh -c "grep foo bar.txt|sort"');
   assert.equal(shell.parts.length, 3);

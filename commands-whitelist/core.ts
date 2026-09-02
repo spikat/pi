@@ -129,6 +129,13 @@ export function splitShellLists(command: string): string[] | undefined {
 		if (c === "\\" && quote !== "'") { current += c; escaped = true; continue; }
 		if ((c === "'" || c === '"') && !quote) { quote = c; current += c; continue; }
 		if (c === quote) { quote = undefined; current += c; continue; }
+		// A `#` at the beginning of a shell word comments out the rest of its
+		// physical line. Skip it here, rather than allowing the comment to become
+		// a standalone command when the following newline splits the shell list.
+		if (!quote && c === "#" && (i === 0 || /[\s;|&]/.test(command[i - 1]!))) {
+			while (i + 1 < command.length && command[i + 1] !== "\n") i++;
+			continue;
+		}
 		if (!quote && (c === "(" || c === "{")) { depth++; current += c; continue; }
 		if (!quote && (c === ")" || c === "}")) { if (depth === 0) return undefined; depth--; current += c; continue; }
 		// `2>&1` is a redirection, not an asynchronous-command separator.
