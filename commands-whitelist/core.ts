@@ -159,7 +159,10 @@ function nestedExpressions(source: string): string[] | undefined {
 		if (source[i] !== "$" && !(source[i] === "<" && source[i + 1] === "(")) continue;
 		const start = source[i] === "$" ? i + 1 : i + 1;
 		if (source[start] !== "(") continue;
-		let depth = 1; let quote: "'" | '"' | undefined; let escaped = false; let j = start + 1;
+		// `$((...))` is arithmetic expansion, not a command substitution. Its
+		// contents must not create a fake command such as the `0` in `$((0))`.
+		const arithmetic = source[i] === "$" && source[start + 1] === "(";
+		let depth = arithmetic ? 2 : 1; let quote: "'" | '"' | undefined; let escaped = false; let j = start + (arithmetic ? 2 : 1);
 		for (; j < source.length && depth; j++) {
 			const c = source[j]!;
 			if (escaped) { escaped = false; continue; }
@@ -170,7 +173,12 @@ function nestedExpressions(source: string): string[] | undefined {
 			if (!quote && c === ")") depth--;
 		}
 		if (depth || quote) return undefined;
-		nested.push(source.slice(start + 1, j - 1)); i = j - 1;
+		if (arithmetic) {
+			const insideArithmetic = nestedExpressions(source.slice(start + 2, j - 2));
+			if (!insideArithmetic) return undefined;
+			nested.push(...insideArithmetic);
+		} else nested.push(source.slice(start + 1, j - 1));
+		i = j - 1;
 	}
 	return nested;
 }

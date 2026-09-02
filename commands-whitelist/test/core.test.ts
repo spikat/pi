@@ -30,6 +30,16 @@ done`);
   ]);
 });
 
+test("does not expose arithmetic expansions as subcommands", () => {
+  const result = analyseShell('git show "$((0))" 2>/dev/null || true; git show --format=fuller --find-renames commit:path | head -115');
+  assert.deepEqual(result.parts.map((part) => part.displayWords.join(" ")), [
+    "git show $((0)) *",
+    "true *",
+    "git show --format=fuller --find-renames commit:path *",
+    "head -115 *",
+  ]);
+});
+
 test("recurses through shell -c and process substitutions", () => {
   const shell = analyseShell('sh -c "grep foo bar.txt|sort"');
   assert.equal(shell.parts.length, 3);
