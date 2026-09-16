@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getMarkdownTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Container, Markdown, SelectList, Spacer, Text } from "@earendil-works/pi-tui";
 
 const MAX_SECTION_CHARS = 50000;
 const MAX_FILE_DIFF_CHARS = 12000;
@@ -261,6 +262,49 @@ function parseFindings(reviewText: string): string[] {
 	return reviewText ? [reviewText] : [];
 }
 
+function chooseFindingAction(ctx: ExtensionContext, finding: string, index: number, total: number): Promise<string | null | undefined> {
+	const prompt = `Finding ${index + 1}/${total}\n\n${finding}\n\nGenerate a fix for this issue?`;
+	if (ctx.mode !== "tui") return ctx.ui.select(prompt, ["yes", "no"]);
+
+	return ctx.ui.custom<string | null>((tui, theme, _keybindings, done) => {
+		const container = new Container();
+		const choices = new SelectList(
+			[
+				{ value: "yes", label: "yes" },
+				{ value: "no", label: "no" },
+			],
+			2,
+			{
+				selectedPrefix: (text) => theme.fg("accent", text),
+				selectedText: (text) => theme.fg("accent", text),
+				description: (text) => theme.fg("muted", text),
+				scrollInfo: (text) => theme.fg("dim", text),
+				noMatch: (text) => theme.fg("warning", text),
+			},
+		);
+		choices.onSelect = (choice) => done(choice.value);
+		choices.onCancel = () => done(null);
+
+		container.addChild(new Text(theme.fg("accent", `Finding ${index + 1}/${total}`), 0, 0));
+		container.addChild(new Spacer(1));
+		container.addChild(new Markdown(finding, 0, 0, getMarkdownTheme()));
+		container.addChild(new Spacer(1));
+		container.addChild(new Text(theme.fg("text", "Generate a fix for this issue?"), 0, 0));
+		container.addChild(new Spacer(1));
+		container.addChild(choices);
+
+		return {
+			render: (width) => container.render(width),
+			invalidate: () => container.invalidate(),
+			handleInput: (data) => {
+				choices.handleInput(data);
+				tui.requestRender();
+			},
+			handleMouse: (event) => choices.handleMouse(event),
+		};
+	});
+}
+
 type ReviewState =
 	| { mode: "idle" }
 	| { mode: "awaiting-review" }
@@ -281,7 +325,7 @@ export default function (pi: ExtensionAPI) {
 		let index = startIndex;
 		while (index < findings.length) {
 			const finding = findings[index]!;
-			const choice = await ctx.ui.select(`Finding ${index + 1}/${findings.length}\n\n${finding}\n\nGenerate a fix for this issue?`, ["yes", "no"]);
+			const choice = await chooseFindingAction(ctx, finding, index, findings.length);
 
 			if (choice === "yes") {
 				state = { mode: "awaiting-fix-validation", findings, index };

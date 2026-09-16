@@ -1,6 +1,6 @@
 {
   "name": "@spikat/pi-review",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Review committed branch and staged Git changes in Pi",
   "license": "MIT",
   "type": "module",
