@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { getMarkdownTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getMarkdownTheme, isToolCallEventType, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, SelectList, Spacer, Text } from "@earendil-works/pi-tui";
 
 const MAX_SECTION_CHARS = 50000;
@@ -7,6 +7,9 @@ const MAX_FILE_DIFF_CHARS = 12000;
 const MAX_LISTED_PATHS = 20;
 const WEB_BRIDGE_SYMBOL = Symbol.for("spikat.pi.web.bridge");
 const WEB_COMMAND_CONTRIBUTORS_SYMBOL = Symbol.for("spikat.pi.web.command-contributors");
+const RUN_RELEVANT_TESTS = "Run all tests relevant to the changes (working branch)";
+const SKIP_TESTS = "Skip test execution (branch already validated in CI)";
+const TEST_RUNNER_COMMAND_PATTERN = /(?:^|(?:&&|\|\||;|\n)\s*)(?:(?:go|cargo|deno|dotnet|flutter|mix|bazel|buck|meson)\s+test\b|ctest\b|(?:npm|pnpm|yarn|bun)\s+(?:(?:run|exec)\s+)?test\b|(?:npx|bunx)\s+(?:--no-install\s+)?(?:jest|vitest|mocha|ava)\b|node\s+--test\b|(?:python(?:3)?\s+-m\s+)?(?:pytest|unittest)\b|(?:uv\s+run|poetry\s+run)\s+pytest\b|(?:make|g?make)\s+test\b|(?:\.?\/?)(?:mvnw|gradlew)\s+test\b|(?:mvn|gradle)\s+test\b|(?:bundle\s+exec\s+)?rspec\b|phpunit\b|php\s+artisan\s+test\b)/im;
 type WebBridge = { registerCommand(name: string, handler: (args: string) => Promise<void> | void): () => void };
 type WebContributor = (bridge: WebBridge) => void;
 function registerWebCommand(name: string, handler: (args: string) => Promise<void> | void): void { const global = globalThis as Record<symbol, unknown>; let contributors = global[WEB_COMMAND_CONTRIBUTORS_SYMBOL] as Set<WebContributor> | undefined; if (!contributors) { contributors = new Set(); global[WEB_COMMAND_CONTRIBUTORS_SYMBOL] = contributors; } const contributor: WebContributor = (bridge) => { bridge.registerCommand(name, handler); }; contributors.add(contributor); (global[WEB_BRIDGE_SYMBOL] as WebBridge | undefined)?.registerCommand(name, handler); }
@@ -248,6 +251,24 @@ function extractAssistantText(message: unknown): string {
 		.trim();
 }
 
+function isTestRunnerCommand(command: string): boolean {
+	return TEST_RUNNER_COMMAND_PATTERN.test(command);
+}
+
+type TestExecution = "run" | "skip";
+
+async function chooseTestExecution(ctx: ExtensionContext): Promise<TestExecution | undefined> {
+	if (!ctx.hasUI) return "skip";
+
+	const choice = await ctx.ui.select("Run tests during this review?", [RUN_RELEVANT_TESTS, SKIP_TESTS]);
+	if (!choice) {
+		ctx.ui.notify("Review cancelled", "info");
+		return undefined;
+	}
+
+	return choice === RUN_RELEVANT_TESTS ? "run" : "skip";
+}
+
 function parseFindings(reviewText: string): string[] {
 	const severity = "Critical|High|Medium|Low|Nit";
 	const headingPattern = new RegExp(`^###\\s+\\[(${severity})\\][^\\n]*(?:\\n(?!###\\s+\\[(?:${severity})\\]).*)*`, "gim");
@@ -307,7 +328,7 @@ function chooseFindingAction(ctx: ExtensionContext, finding: string, index: numb
 
 type ReviewState =
 	| { mode: "idle" }
-	| { mode: "awaiting-review" }
+	| { mode: "awaiting-review"; testExecution: TestExecution }
 	| { mode: "review-interaction"; findings: string[]; index: number }
 	| { mode: "awaiting-fix-validation"; findings: string[]; index: number };
 
@@ -384,6 +405,22 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	pi.on("tool_call", (event) => {
+		if (state.mode !== "awaiting-review" || state.testExecution === "run") return;
+
+		const command = isToolCallEventType("bash", event)
+			? event.input.command
+			: isToolCallEventType("powershell", event)
+				? event.input.command
+				: undefined;
+		if (!command || !isTestRunnerCommand(command)) return;
+
+		return {
+			block: true,
+			reason: "Test execution was disabled for this review. Inspect tests or recommend validation instead of running test commands.",
+		};
+	});
+
 	pi.on("message_end", async (event, ctx) => {
 		const text = extractAssistantText(event.message);
 		if (!text) return;
@@ -407,6 +444,9 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	async function runReview(ctx: ExtensionContext): Promise<void> {
+		const testExecution = await chooseTestExecution(ctx);
+		if (!testExecution) return;
+
 		let workspaceRoot: string;
 		try {
 			workspaceRoot = await runGit(["rev-parse", "--show-toplevel"], ctx.cwd);
@@ -443,6 +483,9 @@ export default function (pi: ExtensionAPI) {
 			"Perform a code review of committed branch changes relative to the baseline and staged index changes.",
 			"Scope boundary: base the review only on the committed range and staged changes supplied below. Do not inspect, mention, or draw conclusions from unstaged or untracked working-tree changes; they are intentionally excluded.",
 			"Staged changes are applied on top of the current branch HEAD.",
+			testExecution === "run"
+				? "Test execution is requested: determine and run every test relevant to the in-scope changes. Do not substitute unrelated broad tests for relevant focused coverage."
+				: "Test execution is intentionally disabled because this branch was already validated in CI. Do not run test runners or test scripts; you may inspect test files and recommend validation.",
 			"Analyze the in-scope changes for:",
 			"- bugs and correctness issues",
 			"- regressions or behavior changes",
@@ -462,6 +505,9 @@ export default function (pi: ExtensionAPI) {
 			"- Do not apply fixes automatically. Leave the final decision to the user on a case-by-case basis.",
 			"- If there are no substantial findings, say so clearly and mention any residual risks or missing validation.",
 			"- Be concise but specific. Avoid generic praise.",
+			testExecution === "run"
+				? "- Report every test command run and its outcome. Clearly state any relevant tests that could not be run."
+				: "- Do not report unrun tests as a failure; state only validation that you recommend.",
 			renderedBranchDiff.truncated || renderedStagedDiff.truncated
 				? "- Some per-file diffs are truncated or omitted after prioritization; explicitly mention that the review may be incomplete and name any relevant unreviewed files from the exhaustive file lists."
 				: undefined,
@@ -515,9 +561,9 @@ export default function (pi: ExtensionAPI) {
 			.join("\n");
 
 		ctx.ui.notify("Generating code review for committed and staged changes…", "info");
-		state = { mode: "awaiting-review" };
+		state = { mode: "awaiting-review", testExecution };
 		pi.sendUserMessage(prompt);
 	}
-	pi.registerCommand("review", { description: "Review committed branch changes against the baseline and staged changes", handler: async (_args, ctx) => { await ctx.waitForIdle(); await runReview(ctx); } });
+	pi.registerCommand("review", { description: "Review committed branch changes and optionally run relevant tests", handler: async (_args, ctx) => { await ctx.waitForIdle(); await runReview(ctx); } });
 	registerWebCommand("review", async () => { if (current?.isIdle()) await runReview(current); });
 }

@@ -13,6 +13,15 @@ It runs a code review of the current branch by analyzing only:
 
 Unstaged and untracked working-tree changes are intentionally excluded from both the Git input and the review scope. The command stops rather than reviewing a committed range when it cannot determine a baseline.
 
+## Test execution
+
+At the start of every interactive review, the extension asks whether to:
+
+- run all tests relevant to the in-scope changes (typically when reviewing your own working branch); or
+- skip test execution (typically when reviewing someone else's branch that CI has already validated).
+
+When tests are selected, the review asks the agent to determine and run every relevant test, then report each command and outcome. When skipped, the agent may inspect test files and recommend validation, but it must not run tests; recognized test-runner commands are also blocked while the review is generated. In non-interactive modes, test execution defaults to skipped.
+
 Diffs are rendered per file (up to 12,000 characters per file and 50,000 characters per change set), while the full changed-file list is retained. When a limit is reached, patches are prioritized for `pkg/security/`, tests, build constraints, Go module metadata, rules, and configuration files. The prompt also includes a change-surface summary: added, deleted, renamed, test, Go-module, and build-constraint changes.
 
 The review looks for, among other things:

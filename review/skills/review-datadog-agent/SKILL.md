@@ -9,6 +9,14 @@ compatibility: Requires Git and an agent or tool that can inspect command output
 
 Use this skill for a checkout of `DataDog/datadog-agent`. It is designed to work from any subdirectory or Git worktree. Perform a focused review only; do not edit files or apply fixes as part of the review.
 
+## Test execution
+
+Before collecting review context, ask the user whether to run all tests relevant to the in-scope changes or to skip test execution. The first option is appropriate for the user's working branch; the second is appropriate when reviewing someone else's branch that CI has already validated.
+
+- If the user chooses to run tests, determine and run every test relevant to the changes. Report each command and outcome, and clearly state any relevant tests that cannot be run.
+- If the user chooses to skip tests, do **not** invoke test runners or test scripts. You may inspect test files, assess test coverage, and recommend validation, but do not treat tests intentionally not run as a failure.
+- If the user cannot answer, default to skipping test execution.
+
 ## Scope and baseline
 
 1. Determine the repository root and current branch. Confirm that a configured Git remote identifies `datadog/datadog-agent` when practical.
@@ -87,3 +95,4 @@ For changes under `pkg/security/`, additionally review:
 - Do not apply fixes automatically.
 - If there are no substantial findings, say so clearly and mention residual risks or missing validation.
 - Be concise, specific, and avoid generic praise.
+- When tests were run, report every test command and outcome. When test execution was skipped, report only recommended validation.
