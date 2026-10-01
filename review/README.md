@@ -29,7 +29,7 @@ Passing a PR URL directly bypasses both setup dialogs and selects **skip tests +
 /review https://github.com/DataDog/datadog-agent/pull/55843
 ```
 
-When tests are selected, the review asks the agent to determine and run every relevant test, then report each command and outcome. When skipped, the agent may inspect test files and recommend validation, but it must not run tests; recognized test-runner commands are also blocked while the review is generated. Without a UI, `/review` defaults to skipped tests and local mode; a PR URL still selects PR mode, but no comments are posted without interactive finding selection.
+When tests are selected, the review asks the agent to determine and run every relevant test, then report each command and outcome. When skipped, the agent may inspect test files and recommend validation, but it must not run tests; recognized test-runner commands are also blocked while the review is generated. Without a terminal/RPC UI or an active Pi Web connection, `/review` defaults to skipped tests and local mode; a PR URL still selects PR mode, but no comments are posted without interactive finding selection.
 
 ## PR comment mode
 
@@ -146,7 +146,13 @@ Then run:
 
 ## Pi Web
 
-When `@spikat/pi-web` is loaded in the same Pi process, `/review` (including a PR URL argument) can also be invoked from the local dashboard. The review output streams to the dashboard; setup and finding-by-finding decisions continue to use Pi's terminal UI.
+With `@spikat/pi-web` **0.1.6 or later** loaded in the same Pi process and `/web on` enabled, `/review` (including a PR URL argument) can be invoked from the dashboard. All decisions are available in the browser: test execution, local fixes versus PR comments, the PR URL, each finding, fix validation, and multiline iteration prompts. Findings retain their Markdown formatting.
+
+In TUI mode, dialogs are mirrored to the terminal and browser. The first answer or cancellation closes both views; a late response cannot trigger a second fix or comment. In RPC or browser-only modes, an active web connection uses browser dialogs without leaving an unanswered RPC dialog behind. Without an active web connection, the existing standalone terminal/RPC behavior is unchanged.
+
+Status icons follow the full workflow: working during Git preparation, review/fix generation, and comment publication; waiting while a question is open; idle/completed afterward. A model completion or metadata refresh cannot clear the waiting state while a decision is still pending. Browser dialog drafts survive dashboard redraws.
+
+After updating the packages, reload Pi. If the dashboard server was already running, run `/web off` in **all connected Pi sessions**, wait a few seconds for the shared server to stop, then run `/web on` and reload the browser so the new dashboard code is loaded.
 
 ## Development tests
 
@@ -157,4 +163,4 @@ npm ci --legacy-peer-deps
 npm test
 ```
 
-The tests use temporary Git repositories, mocked Pi dialogs, and an offline fake GitHub CLI. They cover both modes, author-based defaults, PR fetch/checkout and target-branch scope, separate comments per finding, cancellation, partial publication failures, the existing fix/validation lifecycle, and routing of generic versus Datadog-specific review criteria. No running Pi session, GitHub access, or host peer installation is required.
+The tests use temporary Git repositories, mocked Pi dialogs, and an offline fake GitHub CLI. They cover both modes, author-based defaults, PR fetch/checkout and target-branch scope, separate comments per finding, cancellation, partial publication failures, the existing fix/validation lifecycle, routing of generic versus Datadog-specific review criteria, browser-driven decisions, terminal/browser races, multiline iteration, and cancellation cleanup. No running Pi session, GitHub access, or host peer installation is required.

@@ -1,6 +1,15 @@
 // Minimal components for exercising custom finding dialogs without a real terminal.
 export const getMarkdownTheme = () => ({});
 export const isToolCallEventType = (name, event) => event.toolName === name;
+export const Key = { escape: "\x1b", ctrl: (key) => `ctrl+${key}` };
+export const matchesKey = (data, key) => data === key;
+export class Editor {
+	focused = false;
+	text = "";
+	render() { return this.text.split("\n"); }
+	invalidate() {}
+	handleInput(data) { this.onSubmit?.(data); }
+}
 export class Container {
 	children = [];
 	addChild(child) { this.children.push(child); }

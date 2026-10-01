@@ -98,10 +98,22 @@ async function setup(t, choices = [SKIP_TESTS, FIX_LOCALLY], options = {}) {
 		if (previousContributors === undefined) delete globalThis[contributorSymbol];
 		else globalThis[contributorSymbol] = previousContributors;
 	});
+	const bridgeSymbol = Symbol.for("spikat.pi.web.bridge");
+	const previousBridge = globalThis[bridgeSymbol];
+	if (options.bridge) {
+		globalThis[bridgeSymbol] = {
+			...options.bridge,
+			registerCommand: (name, handler) => { commands.set(`web-${name}`, handler); return () => commands.delete(`web-${name}`); },
+		};
+		t.after(() => {
+			if (previousBridge === undefined) delete globalThis[bridgeSymbol];
+			else globalThis[bridgeSymbol] = previousBridge;
+		});
+	}
 	extension(pi);
 	await handlers.get("session_start")({}, ctx);
 	if (options.web) {
-		const bridge = { registerCommand: (name, handler) => commands.set(`web-${name}`, handler) };
+		const bridge = options.bridge ? globalThis[bridgeSymbol] : { registerCommand: (name, handler) => commands.set(`web-${name}`, handler) };
 		for (const contribute of globalThis[contributorSymbol]) contribute(bridge);
 		await commands.get("web-review")(options.args ?? "");
 	} else {
@@ -548,6 +560,90 @@ test("a second command does not overwrite an active review", async (t) => {
 	await commands.get("review").handler(PR_URL, ctx);
 	assert.equal(sent.length, 1);
 	assert.match(notifications.at(-1).message, /already in progress/);
+});
+
+function browserAnswers(values) {
+	const answers = [...values], dialogs = [], closed = [], statuses = [];
+	const bridge = {
+		active: true,
+		update: ({ status }) => statuses.push(status),
+		openDecision: (dialog) => {
+			let settled = false, resolve;
+			const promise = new Promise((done) => { resolve = done; });
+			const decision = { promise, resolve(value) {
+				if (settled) return;
+				settled = true;
+				closed.push(dialog);
+				resolve(value);
+			} };
+			dialogs.push(dialog);
+			assert.ok(answers.length, `Unexpected browser dialog: ${dialog.title}`);
+			queueMicrotask(() => decision.resolve(answers.shift()));
+			return decision;
+		},
+	};
+	return { bridge, dialogs, closed, statuses };
+}
+
+test("browser answers cover setup, finding decisions, fix validation, and multiline iteration", async (t) => {
+	const prompt = "Keep the bounds check.\nAdd regression coverage for negative indexes.";
+	const browser = browserAnswers([SKIP_TESTS, FIX_LOCALLY, "yes", "iterate with a prompt", prompt, "ok"]);
+	const { dialogs, sent, emit } = await setup(t, [], { bridge: browser.bridge, web: true });
+	assert.equal(browser.statuses[0], "busy");
+	await emit("agent_end", { messages: [assistant(FINDING)] });
+	assert.equal(sent.length, 2);
+	assert.match(browser.dialogs[2].detail, /Missing bounds check/);
+	assert.equal(browser.dialogs[2].data.markdown, true);
+	await emit("agent_end", { messages: [assistant("Applied the fix.")] });
+	assert.equal(sent.length, 3);
+	assert.ok(sent[2].text.includes(prompt));
+	assert.equal(browser.dialogs[4].kind, "input");
+	assert.equal(browser.dialogs[4].data.multiline, true);
+	await emit("agent_end", { messages: [assistant("Updated the fix.")] });
+	assert.equal(dialogs.length, 0, "No terminal/RPC dialog should be left pending");
+	assert.equal(browser.closed.length, 6);
+	assert.ok(browser.statuses.includes("waiting"));
+	assert.equal(browser.statuses.at(-1), "idle");
+});
+
+test("browser-only PR reviews collect the URL and publish only selected findings", async (t) => {
+	const browser = browserAnswers([SKIP_TESTS, COMMENT_ON_PR, PR_URL, "yes", "no"]);
+	const { dialogs, mock, emit } = await setupPR(t, [], {
+		args: "", hasUI: false, web: true, bridge: browser.bridge,
+	});
+	await emit("agent_end", { messages: [assistant(`${FINDING}\n\n${LOW_FINDING}`)] });
+	assert.equal(browser.dialogs[2].title, "GitHub PR URL");
+	assert.equal(dialogs.length, 0);
+	const posts = mock.calls().filter(({ args }) => args.includes("POST"));
+	assert.equal(posts.length, 1);
+	assert.equal(JSON.parse(posts[0].input).body, FINDING);
+	assert.equal(browser.closed.length, 5);
+	assert.equal(browser.statuses.at(-1), "idle");
+});
+
+test("cancelling setup in the browser restores idle without starting the agent", async (t) => {
+	const browser = browserAnswers([undefined]);
+	const { sent } = await setup(t, [], { bridge: browser.bridge, web: true, expectedSent: 0 });
+	assert.equal(sent.length, 0);
+	assert.equal(browser.closed.length, 1);
+	assert.equal(browser.statuses.at(-1), "idle");
+});
+
+test("a new session can use browser review dialogs after the previous session shuts down", async (t) => {
+	const browser = browserAnswers([SKIP_TESTS, FIX_LOCALLY, SKIP_TESTS, FIX_LOCALLY]);
+	const { commands, ctx, sent, emit } = await setup(t, [], { bridge: browser.bridge });
+	await emit("session_shutdown", {});
+	await emit("session_start", {});
+	await commands.get("review").handler("", ctx);
+	assert.equal(sent.length, 2);
+	assert.equal(browser.dialogs.length, 4);
+});
+
+test("a browser review startup error restores idle without opening dialogs", async (t) => {
+	const browser = browserAnswers([]);
+	await setup(t, [], { bridge: browser.bridge, web: true, args: "invalid-pr", expectedSent: 0 });
+	assert.equal(browser.dialogs.length, 0);
+	assert.deepEqual(browser.statuses, ["busy", "idle"]);
 });
 
 function assertGenericReviewQuality(text) {

@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { getMarkdownTheme, isToolCallEventType, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, SelectList, Spacer, Text } from "@earendil-works/pi-tui";
+import { ReviewUI } from "./web-ui.js";
 
 const MAX_SECTION_CHARS = 50000;
 const MAX_FILE_DIFF_CHARS = 12000;
@@ -310,14 +311,14 @@ async function isOwnBranch(cwd: string): Promise<boolean> {
 	return !!authorName && !!userName && authorName === userName;
 }
 
-async function chooseReviewOptions(ctx: ExtensionContext): Promise<ReviewOptions | undefined> {
-	if (!ctx.hasUI) return { testExecution: "skip", action: "fix" };
+async function chooseReviewOptions(ctx: ExtensionContext, ui: ReviewUI): Promise<ReviewOptions | undefined> {
+	if (!ui.available(ctx)) return { testExecution: "skip", action: "fix" };
 
 	const ownBranch = await isOwnBranch(ctx.cwd);
 	// The first item is selected by default in both TUI and RPC dialogs.
-	const tests = await ctx.ui.select("Run tests during this review?", ownBranch
+	const tests = await ui.select(ctx, "Run tests during this review?", ownBranch
 		? [RUN_RELEVANT_TESTS, SKIP_TESTS] : [SKIP_TESTS, RUN_RELEVANT_TESTS]);
-	const action = tests && await ctx.ui.select("How should review findings be handled?", ownBranch
+	const action = tests && await ui.select(ctx, "How should review findings be handled?", ownBranch
 		? [FIX_LOCALLY, COMMENT_ON_PR] : [COMMENT_ON_PR, FIX_LOCALLY]);
 	if (!tests || !action) {
 		ctx.ui.notify("Review cancelled", "info");
@@ -379,12 +380,20 @@ function parseFindings(reviewText: string): string[] {
 	return reviewText.match(bulletPattern)?.map((finding) => finding.trim()).filter(Boolean) ?? [];
 }
 
-function chooseFindingAction(ctx: ExtensionContext, finding: string, index: number, total: number, action: ReviewAction = "fix"): Promise<string | null | undefined> {
+function chooseFindingAction(ctx: ExtensionContext, ui: ReviewUI, finding: string, index: number, total: number, action: ReviewAction = "fix"): Promise<string | null | undefined> {
 	const question = action === "comment" ? "Post a comment on the PR for this issue?" : "Generate a fix for this issue?";
 	const prompt = `Finding ${index + 1}/${total}\n\n${finding}\n\n${question}`;
-	if (ctx.mode !== "tui") return ctx.ui.select(prompt, ["yes", "no"]);
-
-	return ctx.ui.custom<string | null>((tui, theme, _keybindings, done) => {
+	const terminal = (signal: AbortSignal) => ctx.ui.custom<string | null>((tui, theme, _keybindings, done) => {
+		let finished = false;
+		const finish = (value: string | null) => {
+			if (finished) return;
+			finished = true;
+			signal.removeEventListener("abort", cancel);
+			done(value);
+		};
+		const cancel = () => finish(null);
+		signal.addEventListener("abort", cancel, { once: true });
+		if (signal.aborted) cancel();
 		const container = new Container();
 		const choices = new SelectList(
 			[
@@ -400,8 +409,8 @@ function chooseFindingAction(ctx: ExtensionContext, finding: string, index: numb
 				noMatch: (text) => theme.fg("warning", text),
 			},
 		);
-		choices.onSelect = (choice) => done(choice.value);
-		choices.onCancel = () => done(null);
+		choices.onSelect = (choice) => finish(choice.value);
+		choices.onCancel = cancel;
 
 		container.addChild(new Text(theme.fg("accent", `Finding ${index + 1}/${total}`), 0, 0));
 		container.addChild(new Spacer(1));
@@ -419,8 +428,13 @@ function chooseFindingAction(ctx: ExtensionContext, finding: string, index: numb
 				tui.requestRender();
 			},
 			handleMouse: (event) => choices.handleMouse(event),
+			dispose: () => signal.removeEventListener("abort", cancel),
 		};
 	});
+	return ui.decide(ctx, {
+		kind: "select", title: `Finding ${index + 1}/${total}`,
+		detail: `${finding}\n\n${question}`, options: ["yes", "no"], data: { markdown: true },
+	}, (signal) => ctx.mode === "tui" ? terminal(signal) : ctx.ui.select(prompt, ["yes", "no"], { signal }));
 }
 
 type ReviewState =
@@ -433,17 +447,24 @@ export default function (pi: ExtensionAPI) {
 	let state: ReviewState = { mode: "idle" };
 	let current: ExtensionContext | undefined;
 	let preparing = false;
-	pi.on("session_start", async (_event, ctx) => { current = ctx; state = { mode: "idle" }; });
+	let reviewUI = new ReviewUI();
+	pi.on("session_start", async (_event, ctx) => {
+		reviewUI.dispose(); reviewUI = new ReviewUI();
+		current = ctx; state = { mode: "idle" }; preparing = false;
+	});
+	pi.on("session_shutdown", () => { reviewUI.dispose(); current = undefined; state = { mode: "idle" }; });
 
 	async function processPullRequestFindings(ctx: ExtensionContext, findings: string[], pr: PreparedPullRequest): Promise<void> {
-		if (!ctx.hasUI) {
+		const ui = reviewUI;
+		if (!ui.available(ctx)) {
 			state = { mode: "idle" };
 			ctx.ui.notify("PR comments were not posted: interactive finding selection is required", "info");
 			return;
 		}
 		const selected: string[] = [];
 		for (let index = 0; index < findings.length; index++) {
-			const choice = await chooseFindingAction(ctx, findings[index]!, index, findings.length, "comment");
+			const choice = await chooseFindingAction(ctx, ui, findings[index]!, index, findings.length, "comment");
+			if (ui.isDisposed) return;
 			if (!choice) {
 				state = { mode: "idle" };
 				ctx.ui.notify("Review cancelled; no PR comments sent", "info");
@@ -456,9 +477,11 @@ export default function (pi: ExtensionAPI) {
 			if (selected.length > 0) {
 				// Collect every decision first, then publish one comment per issue.
 				for (const finding of selected) {
+					if (ui.isDisposed) return;
 					await postPullRequestComment(pr, finding);
 					posted++;
 				}
+				if (ui.isDisposed) return;
 				ctx.ui.notify(`Posted ${posted} separate PR comment(s) on ${pr.url}`, "info");
 			} else {
 				ctx.ui.notify("No PR comments selected; nothing sent", "info");
@@ -466,12 +489,13 @@ export default function (pi: ExtensionAPI) {
 		} catch (error) {
 			ctx.ui.notify(`Could not confirm PR comment ${posted + 1}/${selected.length}: ${error instanceof Error ? error.message : String(error)}. ${posted} comment(s) confirmed posted; subsequent comments were not attempted. Check the PR before retrying.`, "error");
 		} finally {
-			state = { mode: "idle" };
+			if (!ui.isDisposed) state = { mode: "idle" };
 		}
 	}
 
 	async function processNextFinding(ctx: ExtensionContext, findings: string[], startIndex: number): Promise<void> {
-		if (!ctx.hasUI) {
+		const ui = reviewUI;
+		if (!ui.available(ctx)) {
 			state = { mode: "idle" };
 			return;
 		}
@@ -479,7 +503,8 @@ export default function (pi: ExtensionAPI) {
 		let index = startIndex;
 		while (index < findings.length) {
 			const finding = findings[index]!;
-			const choice = await chooseFindingAction(ctx, finding, index, findings.length);
+			const choice = await chooseFindingAction(ctx, ui, finding, index, findings.length);
+			if (ui.isDisposed) return;
 
 			if (choice === "yes") {
 				state = { mode: "awaiting-fix-validation", findings, index };
@@ -502,20 +527,23 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function validateFix(ctx: ExtensionContext, findings: string[], index: number): Promise<void> {
-		if (!ctx.hasUI) {
+		const ui = reviewUI;
+		if (!ui.available(ctx)) {
 			state = { mode: "idle" };
 			return;
 		}
 
 		while (true) {
-			const choice = await ctx.ui.select(`Fix validation ${index + 1}/${findings.length}`, ["ok", "iterate with a prompt"]);
+			const choice = await ui.select(ctx, `Fix validation ${index + 1}/${findings.length}`, ["ok", "iterate with a prompt"]);
+			if (ui.isDisposed) return;
 			if (!choice || choice === "ok") {
 				await processNextFinding(ctx, findings, index + 1);
 				return;
 			}
 
 			if (choice === "iterate with a prompt") {
-				const prompt = await ctx.ui.editor("Iteration prompt for the fix");
+				const prompt = await ui.editor(ctx, "Iteration prompt for the fix");
+				if (ui.isDisposed) return;
 				const trimmed = prompt?.trim();
 				if (!trimmed) {
 					ctx.ui.notify("Empty or cancelled prompt", "warning");
@@ -559,40 +587,44 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
-		// A message can contain commentary followed by tool calls. Wait for the
-		// whole agent run so neither review decisions nor fix validation interrupt it.
-		const message = [...event.messages].reverse().find((message) => message.role === "assistant");
-		if (!message || message.role !== "assistant") return;
-		if (message.stopReason === "error" || message.stopReason === "aborted") {
-			// Preserve the review for an agent retry, but allow an explicit /review restart.
-			if (state.mode === "awaiting-review") state = { ...state, interrupted: true };
-			return;
-		}
-		if (message.stopReason === "toolUse") return;
-		const text = extractAssistantText(message);
-		if (!text) return;
+		const ui = reviewUI;
+		try {
+			// Wait for the whole run so dialogs cannot interrupt commentary or tool calls.
+			const message = [...event.messages].reverse().find((message) => message.role === "assistant");
+			if (!message || message.role !== "assistant") return;
+			if (message.stopReason === "error" || message.stopReason === "aborted") {
+				// Preserve the review for an agent retry, but allow an explicit /review restart.
+				if (state.mode === "awaiting-review") state = { ...state, interrupted: true };
+				return;
+			}
+			if (message.stopReason === "toolUse") return;
+			const text = extractAssistantText(message);
+			if (!text) return;
 
-		if (state.mode === "awaiting-review") {
-			const pullRequest = state.pullRequest;
-			const findings = parseFindings(text);
-			if (findings.length === 0) {
-				state = { mode: "idle" };
-				if (ctx.hasUI) ctx.ui.notify("No structured review findings to process; see the assistant response", "info");
+			if (state.mode === "awaiting-review") {
+				const pullRequest = state.pullRequest;
+				const findings = parseFindings(text);
+				if (findings.length === 0) {
+					state = { mode: "idle" };
+					if (ctx.hasUI) ctx.ui.notify("No structured review findings to process; see the assistant response", "info");
+					return;
+				}
+
+				state = { mode: "review-interaction", findings, index: 0 };
+				if (pullRequest) await processPullRequestFindings(ctx, findings, pullRequest);
+				else await processNextFinding(ctx, findings, 0);
 				return;
 			}
 
-			state = { mode: "review-interaction", findings, index: 0 };
-			if (pullRequest) await processPullRequestFindings(ctx, findings, pullRequest);
-			else await processNextFinding(ctx, findings, 0);
-			return;
-		}
-
-		if (state.mode === "awaiting-fix-validation") {
-			await validateFix(ctx, state.findings, state.index);
+			if (state.mode === "awaiting-fix-validation") {
+				await validateFix(ctx, state.findings, state.index);
+			}
+		} finally {
+			if (!ui.isDisposed && state.mode === "idle" && !preparing) ui.status(ctx.isIdle() ? "idle" : "busy");
 		}
 	});
 
-	async function generateReview(ctx: ExtensionContext, args: string): Promise<void> {
+	async function generateReview(ctx: ExtensionContext, args: string, ui: ReviewUI): Promise<void> {
 		let workspaceRoot: string;
 		try {
 			workspaceRoot = await runGit(["rev-parse", "--show-toplevel"], ctx.cwd);
@@ -603,11 +635,11 @@ export default function (pi: ExtensionAPI) {
 
 		let pr: PullRequest | undefined;
 		if (args.trim()) pr = parsePullRequest(args);
-		const options = pr ? { testExecution: "skip" as const, action: "comment" as const } : await chooseReviewOptions(ctx);
+		const options = pr ? { testExecution: "skip" as const, action: "comment" as const } : await chooseReviewOptions(ctx, ui);
 		if (!options) return;
 		const { testExecution } = options;
 		if (options.action === "comment" && !pr) {
-			const url = await ctx.ui.input("GitHub PR URL", "https://github.com/owner/repo/pull/123");
+			const url = await ui.input(ctx, "GitHub PR URL", "https://github.com/owner/repo/pull/123");
 			if (!url?.trim()) {
 				ctx.ui.notify("Review cancelled", "info");
 				return;
@@ -726,6 +758,7 @@ export default function (pi: ExtensionAPI) {
 			.filter((line): line is string => line !== undefined)
 			.join("\n");
 
+		if (ui.isDisposed) return;
 		ctx.ui.notify(pullRequest ? "Generating PR review…" : "Generating code review for committed and staged changes…", "info");
 		state = { mode: "awaiting-review", testExecution, pullRequest };
 		pi.sendUserMessage(prompt);
@@ -737,16 +770,26 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify("A review is already in progress", "warning");
 			return;
 		}
+		const ui = reviewUI;
 		preparing = true;
+		ui.status("busy");
 		try {
-			await generateReview(ctx, args);
+			await generateReview(ctx, args, ui);
 		} catch (error) {
+			if (ui.isDisposed) return;
 			state = { mode: "idle" };
 			ctx.ui.notify(`Could not start review: ${error instanceof Error ? error.message : String(error)}`, "error");
 		} finally {
-			preparing = false;
+			if (!ui.isDisposed) {
+				preparing = false;
+				ui.status(state.mode === "idle" && ctx.isIdle() ? "idle" : "busy");
+			}
 		}
 	}
 	pi.registerCommand("review", { description: "Review changes: choose tests and local fixes or PR comments; accepts a GitHub PR URL", handler: async (args, ctx) => { await ctx.waitForIdle(); await runReview(ctx, args); } });
-	registerWebCommand("review", async (args) => { if (current?.isIdle()) await runReview(current, args); });
+	registerWebCommand("review", async (args) => {
+		if (!current) return;
+		if (!current.isIdle()) { current.ui.notify("Wait for the agent to finish before starting a review", "warning"); return; }
+		await runReview(current, args);
+	});
 }

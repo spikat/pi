@@ -33,7 +33,7 @@ Open that exact URL in a browser. The bridge uses a generated self-signed certif
 
 The first `on` command selects the port. While a bridge has connected agents, another explicit port is rejected rather than silently splitting the dashboard into two local bridges. Use `/web on` in subsequent sessions to join it.
 
-The bridge stops automatically a few seconds after the last connected Pi session exits or runs `/web off`. During local development, the detached bridge keeps the `server.mjs` code it loaded at startup; run `/web off` in every connected Pi session, then `/web on` again (and reload the browser) after changing dashboard code.
+The bridge stops automatically a few seconds after the last connected Pi session exits or runs `/web off`. During local development, the detached bridge keeps the `server.mjs` code it loaded at startup; run `/web off` in every connected Pi session, wait a few seconds for the shared server to stop, then run `/web on` again (and reload the browser) after changing dashboard code.
 
 ## Dashboard behavior
 
@@ -56,6 +56,14 @@ Pi's public extension API does not expose a generic executor for arbitrary built
 
 When `@spikat/pi-commands-whitelist` and this package are both loaded in the same Pi process, shell-command and file-edit reviews are mirrored to the dashboard as well as the terminal. A waiting dialog is inserted into the live transcript after the triggering prompt and before subsequent agent output, rather than below the message composer. The first valid answer wins; the terminal dialog and browser dialog are both dismissed after that decision. Whenever a shell-command review is required, its generated one-to-three-sentence task summary appears after the full command and before the choices in both views. The browser provides the same per-command state cycle, argument-prefix controls, Python-script restriction, validation, prompt, cancellation, and help as the terminal shell review: `🔁` allows one request, `✅` saves an allow rule for the project, `💾` saves an allow rule globally, `❌` saves a project deny rule, and `❌💾` saves a global deny rule. File-edit reviews remain project-scoped and offer one-time or persistent directory/file approval, denial, and a mirrored assistant-prompt editor.
 
+## Review integration
+
+With `@spikat/pi-review` **1.3.4 or later** loaded in the same process, `/review` works end-to-end from the dashboard, including a PR URL argument. Test/mode selection, the PR URL, finding-by-finding decisions, fix validation, and multiline iteration prompts are answerable in the browser. Findings are rendered as Markdown. In TUI mode, the first browser or terminal answer closes both views; in browser-only/RPC sessions, review uses browser dialogs while the bridge is active.
+
+The waiting icon remains active until all pending dialogs close, even if the model settles or session metadata changes. Review also reports working status during Git preparation and comment publication, and restores idle/completed status afterward. Selection and text drafts in review dialogs survive dashboard redraws.
+
+The existing bridge integration surface supports these optional dialog hints through `WebDialog.data`: `markdown: true` renders the detail as safe Markdown, `multiline: true` renders an input as a textarea, and `placeholder` sets the input hint. Existing callers without these hints retain their current controls.
+
 ## Security model
 
 - The HTTPS server listens only on `127.0.0.1`.
@@ -66,7 +74,7 @@ When `@spikat/pi-commands-whitelist` and this package are both loaded in the sam
 
 ## Limitations
 
-This is an event-based dashboard, not an ANSI terminal mirror. It cannot universally reproduce arbitrary custom TUI dialogs supplied by unrelated extensions. It can mirror decisions implemented through its integration surface, including the `commands-whitelist` shell gate.
+This is an event-based dashboard, not an ANSI terminal mirror. It cannot universally reproduce arbitrary custom TUI dialogs supplied by unrelated extensions. It can mirror decisions implemented through its integration surface, including the `commands-whitelist` shell gate and `review` workflow.
 
 ## Development
 
