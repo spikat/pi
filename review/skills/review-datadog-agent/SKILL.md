@@ -1,6 +1,6 @@
 ---
 name: review-datadog-agent
-description: Review committed and staged changes in DataDog/datadog-agent, with an additional security-review checklist for pkg/security event collection, eBPF, policies, lifecycle, and validation.
+description: Review committed and staged changes in DataDog/datadog-agent, including comment accuracy, test value, runtime observability, event field exposure, and a pkg/security checklist for event collection, eBPF, policies, lifecycle, and validation.
 license: MIT
 compatibility: Requires Git and an agent or tool that can inspect command output without changing the repository.
 ---
@@ -45,6 +45,32 @@ Analyze the in-scope changes for:
 - performance problems;
 - security or data-loss risks;
 - maintainability, test coverage, and other relevant concerns.
+
+### Function comments and documentation
+
+- Review comments and docstrings on every added or modified function for accuracy and concision; flag stale descriptions of behavior, parameters, return values, and side effects.
+- Check that non-obvious intent, invariants, preconditions, and concurrency assumptions are explained where needed. Do not demand comments that merely restate self-explanatory code.
+
+### Test value
+
+- Assess whether added or modified tests protect project-specific behavior, contracts, edge cases, or plausible regressions, with assertions that would catch a meaningful defect.
+- Flag redundant tests that only mirror the implementation or re-test a standard collection, such as Add/Get wrappers that directly forward to an array without adding a project-specific contract. Simple tests are still valuable when they protect real project logic.
+
+Use the diff, change surface, and commit context as evidence. Do not manufacture a finding merely because a category exists in this checklist.
+
+## Additional Datadog Agent-wide review criteria
+
+Apply these checks to relevant changes throughout the Agent, not only `pkg/security/`.
+
+### Runtime observability
+
+- For new logic such as a cache or resolver, assess whether existing metrics make its behavior diagnosable or whether useful new metrics are warranted (for example hits/misses, evictions, occupancy, resolution failures, or latency).
+- Recommend metrics only for concrete operational questions not already covered; keep label cardinality bounded and hot-path overhead low.
+
+### Event field exposure
+
+- When event fields are added or changed, assess whether they should be serialized in reported events and/or exposed to SECL rules so downstream consumers can use them. Flag unjustified omissions, not intentional internal-only or sensitive fields.
+- Check the applicable serializers, model tags, generated accessors, field documentation, and tests for consistent types, naming, availability, and backward compatibility. Do not require serialization or SECL exposure without a concrete consumer need.
 
 ## Additional `pkg/security/` review criteria
 

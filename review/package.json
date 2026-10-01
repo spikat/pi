@@ -1,7 +1,7 @@
 {
   "name": "@spikat/pi-review",
-  "version": "1.3.1",
-  "description": "Review Git changes in Pi with local fixes or batched GitHub PR comments",
+  "version": "1.3.3",
+  "description": "Review Git changes in Pi with local fixes or per-issue GitHub PR comments",
   "license": "MIT",
   "type": "module",
   "keywords": [

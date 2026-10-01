@@ -200,6 +200,26 @@ function isDatadogAgentRepository(remoteUrls: string | undefined): boolean {
 	}) ?? false;
 }
 
+const GENERAL_REVIEW_QUALITY = [
+	"- Function comments and documentation:",
+	"  - Review comments and docstrings on every added or modified function for accuracy and concision; flag stale descriptions of behavior, parameters, return values, and side effects.",
+	"  - Check that non-obvious intent, invariants, preconditions, and concurrency assumptions are explained where needed. Do not demand comments that merely restate self-explanatory code.",
+	"- Test value:",
+	"  - Assess whether added or modified tests protect project-specific behavior, contracts, edge cases, or plausible regressions, with assertions that would catch a meaningful defect.",
+	"  - Flag redundant tests that only mirror the implementation or re-test a standard collection, such as Add/Get wrappers that directly forward to an array without adding a project-specific contract. Simple tests are still valuable when they protect real project logic.",
+	"Use concrete evidence from the in-scope changes; do not manufacture a finding merely because a checklist category exists.",
+].join("\n");
+
+const DATADOG_AGENT_OBSERVABILITY_REVIEW = [
+	"For Datadog Agent changes, additionally review:",
+	"- Runtime observability:",
+	"  - For new logic such as a cache or resolver, assess whether existing metrics make its behavior diagnosable or whether useful new metrics are warranted (for example hits/misses, evictions, occupancy, resolution failures, or latency).",
+	"  - Recommend metrics only for concrete operational questions not already covered; keep label cardinality bounded and hot-path overhead low.",
+	"- Event field exposure:",
+	"  - When event fields are added or changed, assess whether they should be serialized in reported events and/or exposed to SECL rules so downstream consumers can use them. Flag unjustified omissions, not intentional internal-only or sensitive fields.",
+	"  - Check the applicable serializers, model tags, generated accessors, field documentation, and tests for consistent types, naming, availability, and backward compatibility. Do not require serialization or SECL exposure without a concrete consumer need.",
+].join("\n");
+
 const DATADOG_AGENT_SECURITY_REVIEW = [
 	"For changes under pkg/security/, additionally review:",
 	"- Event-pipeline correctness:",
@@ -341,11 +361,12 @@ async function preparePullRequest(pr: PullRequest, cwd: string, remoteUrls: stri
 	return { ...pr, head, base, cwd };
 }
 
-async function postPullRequestReview(pr: PreparedPullRequest, findings: string[]): Promise<void> {
-	// One COMMENT review, not approvals, change requests, or one API call per issue.
+async function postPullRequestComment(pr: PreparedPullRequest, finding: string): Promise<void> {
+	// A separate COMMENT review per finding keeps each issue independently
+	// discussable while preserving its association with the reviewed commit.
 	await runCommand("gh", ["api", "--hostname", "github.com", "--method", "POST",
 		`repos/${pr.owner}/${pr.repo}/pulls/${pr.number}/reviews`, "--input", "-"], pr.cwd,
-		JSON.stringify({ commit_id: pr.head, event: "COMMENT", body: findings.join("\n\n") }));
+		JSON.stringify({ commit_id: pr.head, event: "COMMENT", body: finding }));
 }
 
 function parseFindings(reviewText: string): string[] {
@@ -430,15 +451,20 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (choice === "yes") selected.push(findings[index]!);
 		}
+		let posted = 0;
 		try {
 			if (selected.length > 0) {
-				await postPullRequestReview(pr, selected);
-				ctx.ui.notify(`Posted ${selected.length} finding(s) in one review on ${pr.url}`, "info");
+				// Collect every decision first, then publish one comment per issue.
+				for (const finding of selected) {
+					await postPullRequestComment(pr, finding);
+					posted++;
+				}
+				ctx.ui.notify(`Posted ${posted} separate PR comment(s) on ${pr.url}`, "info");
 			} else {
 				ctx.ui.notify("No PR comments selected; nothing sent", "info");
 			}
 		} catch (error) {
-			ctx.ui.notify(`Could not confirm PR review submission: ${error instanceof Error ? error.message : String(error)}. Check the PR before retrying.`, "error");
+			ctx.ui.notify(`Could not confirm PR comment ${posted + 1}/${selected.length}: ${error instanceof Error ? error.message : String(error)}. ${posted} comment(s) confirmed posted; subsequent comments were not attempted. Check the PR before retrying.`, "error");
 		} finally {
 			state = { mode: "idle" };
 		}
@@ -630,8 +656,10 @@ export default function (pi: ExtensionAPI) {
 			"- performance problems",
 			"- security or data-loss risks",
 			"- maintainability, test coverage, and other relevant concerns",
+			GENERAL_REVIEW_QUALITY,
 			datadogAgentWorkspace ? "" : undefined,
 			datadogAgentWorkspace ? "Datadog Agent workspace detected:" : undefined,
+			datadogAgentWorkspace ? DATADOG_AGENT_OBSERVABILITY_REVIEW : undefined,
 			datadogAgentWorkspace ? DATADOG_AGENT_SECURITY_REVIEW : undefined,
 			"",
 			"Output requirements:",

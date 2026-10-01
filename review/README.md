@@ -39,9 +39,9 @@ The extension reads the PR head and target branch from GitHub, runs `git fetch` 
 
 Only committed PR changes are in scope. Staged, unstaged, and untracked changes are excluded, even when already on the PR head. The agent is instructed not to modify files or publish comments; direct `edit` and `write` tool calls are blocked during the PR review.
 
-After the agent finishes, each structured finding is presented with a `yes`/`no` choice to post a PR comment rather than generate a fix. Nothing is sent while these decisions are being collected. Once every finding has been processed, the selected findings are grouped into the body of **one GitHub `COMMENT` review**, tied to the reviewed commit, and submitted in one API call. This is a general review comment, not inline comments, an approval, or a request for changes.
+After the agent finishes, each structured finding is presented with a `yes`/`no` choice to post a PR comment rather than generate a fix. Nothing is sent while these decisions are being collected. Once every finding has been processed, the extension publishes **one separate comment per selected finding**, in selection order. Each comment is submitted as its own GitHub `COMMENT` review tied to the reviewed commit, with one API call per issue. Findings are never combined into a single comment. These are general review comments, not inline comments, approvals, or requests for changes.
 
-If no findings are selected, nothing is posted. Cancelling a finding dialog discards the entire pending batch. Submission errors are reported without automatic retries, to avoid duplicate reviews; check the PR before retrying.
+If no findings are selected, nothing is posted. Cancelling a finding dialog discards the entire pending batch. Publication is sequential, not atomic: if a submission fails, the extension stops, reports which comment failed and how many preceding comments were confirmed posted, and leaves subsequent comments unattempted. It never automatically retries, to avoid duplicates; check the PR before retrying, since the failed request may still have reached GitHub.
 
 Diffs are rendered per file (up to 12,000 characters per file and 50,000 characters per change set), while the full changed-file list is retained. When a limit is reached, patches are prioritized for `pkg/security/`, tests, build constraints, Go module metadata, rules, and configuration files. The prompt also includes a change-surface summary: added, deleted, renamed, test, Go-module, and build-constraint changes.
 
@@ -53,9 +53,23 @@ The review looks for, among other things:
 - security or data-loss risks;
 - maintainability, test coverage, and other relevant concerns.
 
+For every repository, also assess:
+
+- **Function comments and documentation:** comments on added or modified functions must remain accurate and concise, and explain non-obvious intent, invariants, preconditions, or concurrency assumptions where needed. Do not request comments that merely restate clear code.
+- **Test value:** added or modified tests should protect project-specific behavior, contracts, edge cases, or plausible regressions. Flag redundant tests that only mirror the implementation or re-test a standard collection (for example trivial Add/Get wrappers around an array), without dismissing simple tests that guard a real contract.
+
+These criteria must lead to evidence-based findings, not automatic demands for more comments or tests.
+
 ## Datadog Agent mode
 
-For a checkout with any configured remote ending in `datadog/datadog-agent` (SSH and HTTPS forms are supported), the extension appends the following `pkg/security/`-specific checklist to the review prompt. Detection is performed through Git, so it works from any subdirectory or worktree of that repository.
+For a checkout with any configured remote ending in `datadog/datadog-agent` (SSH and HTTPS forms are supported), the extension adds these Agent-wide checks when relevant:
+
+- **Runtime observability:** assess whether new logic (such as a cache or resolver) needs metrics beyond existing instrumentation to answer concrete operational questions. Consider hits/misses, evictions, occupancy, resolution failures, or latency, while avoiding duplicate metrics, unbounded label cardinality, and excessive hot-path overhead.
+- **Event field exposure:** when an event changes, assess whether added or changed fields should be serialized in reported events and/or exposed to SECL rules for downstream consumers. Respect intentional internal-only or sensitive fields, and check applicable serializers, model tags, generated accessors, documentation, tests, and compatibility.
+
+These two checks are specific to Datadog Agent; they are not added for other repositories. They ask whether instrumentation or field exposure is useful, rather than requiring it systematically.
+
+The extension also appends the following `pkg/security/`-specific checklist. Detection is performed through Git, so it works from any subdirectory or worktree of that repository.
 
 > For changes under `pkg/security/`, additionally review:
 >
@@ -104,7 +118,7 @@ You retain control over each decision.
 Tool-agnostic Agent Skills equivalents are available for review workflows outside Pi:
 
 - [`skills/review-generic/SKILL.md`](skills/review-generic/SKILL.md) for any Git repository;
-- [`skills/review-datadog-agent/SKILL.md`](skills/review-datadog-agent/SKILL.md) for `datadog/datadog-agent`, including the `pkg/security/` checklist.
+- [`skills/review-datadog-agent/SKILL.md`](skills/review-datadog-agent/SKILL.md) for `datadog/datadog-agent`, including the Agent-wide observability and event-field checks plus the `pkg/security/` checklist.
 
 Copy the relevant skill directory into the skill location used by your agent harness, or provide its `SKILL.md` as the review instructions. Both skills require only Git and deliberately exclude unstaged and untracked changes from their review scope.
 
@@ -143,4 +157,4 @@ npm ci --legacy-peer-deps
 npm test
 ```
 
-The tests use temporary Git repositories, mocked Pi dialogs, and an offline fake GitHub CLI. They cover both modes, author-based defaults, PR fetch/checkout and target-branch scope, batch publication, cancellation, failures, and the existing fix/validation lifecycle. No running Pi session, GitHub access, or host peer installation is required.
+The tests use temporary Git repositories, mocked Pi dialogs, and an offline fake GitHub CLI. They cover both modes, author-based defaults, PR fetch/checkout and target-branch scope, separate comments per finding, cancellation, partial publication failures, the existing fix/validation lifecycle, and routing of generic versus Datadog-specific review criteria. No running Pi session, GitHub access, or host peer installation is required.

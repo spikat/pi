@@ -136,7 +136,9 @@ const args = process.argv.slice(2);
 const post = args.includes("POST");
 const input = post ? readFileSync(0, "utf8") : "";
 appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args, input }) + "\\n");
-if (${!!options.failRead} && !post || ${!!options.failPost} && post) {
+const postAttempts = readFileSync(${JSON.stringify(logPath)}, "utf8").trim().split("\\n")
+  .map((line) => JSON.parse(line)).filter(({ args }) => args.includes("POST")).length;
+if (${!!options.failRead} && !post || post && (${!!options.failPost} || postAttempts === ${options.failPostAt ?? 0})) {
   console.error("mock GitHub error"); process.exit(1);
 }
 console.log(JSON.stringify(post ? { id: 1 } : ${JSON.stringify(metadata)}));
@@ -292,7 +294,7 @@ test("interactive PR mode asks for URL and honors requested tests", async (t) =>
 	assert.equal((await emit("tool_call", { toolName: "edit", input: {} })).block, true);
 });
 
-test("PR comments are batched after all decisions and never generate fixes", async (t) => {
+test("PR comments are posted separately after all decisions and never generate fixes", async (t) => {
 	const { dialogs, sent, mock, emit, ctx, notifications } = await setupPR(t, ["yes", "no", "yes"]);
 	ctx.beforeAnswer = () => assert.equal(mock.calls().filter(({ args }) => args.includes("POST")).length, 0);
 	const third = "### [Nit] Unclear name\nRename this variable.";
@@ -301,12 +303,15 @@ test("PR comments are batched after all decisions and never generate fixes", asy
 	assert.ok(dialogs.every(({ prompt }) => prompt.includes("Post a comment on the PR")));
 	assert.equal(sent.length, 1, "No fix or validation follow-up");
 	const posts = mock.calls().filter(({ args }) => args.includes("POST"));
-	assert.equal(posts.length, 1);
-	assert.ok(posts[0].args.includes("repos/Example/repo/pulls/42/reviews"));
-	assert.deepEqual(JSON.parse(posts[0].input), { commit_id: mock.head, event: "COMMENT", body: `${FINDING}\n\n${third}` });
-	assert.match(notifications.at(-1).message, /Posted 2 finding/);
+	assert.equal(posts.length, 2);
+	assert.ok(posts.every(({ args }) => args.includes("repos/Example/repo/pulls/42/reviews")));
+	assert.deepEqual(posts.map(({ input }) => JSON.parse(input)), [
+		{ commit_id: mock.head, event: "COMMENT", body: FINDING },
+		{ commit_id: mock.head, event: "COMMENT", body: third },
+	]);
+	assert.match(notifications.at(-1).message, /Posted 2 separate PR comment/);
 	await emit("agent_end", { messages: [assistant(FINDING)] });
-	assert.equal(mock.calls().filter(({ args }) => args.includes("POST")).length, 1, "Cannot post twice");
+	assert.equal(mock.calls().filter(({ args }) => args.includes("POST")).length, 2, "Cannot post twice");
 });
 
 for (const [name, choices, text] of [
@@ -418,6 +423,32 @@ test("PR publication failure is reported and never automatically retried", async
 	assert.equal(sent.length, 1);
 });
 
+test("four selected issues produce four separate comments, never one combined body", async (t) => {
+	const findings = [FINDING, LOW_FINDING, "### [Low] Third issue\nThird issue details.", "### [Nit] Fourth issue\nFourth issue details."];
+	const { emit, mock } = await setupPR(t, ["yes", "yes", "yes", "yes"]);
+	await emit("agent_end", { messages: [assistant(findings.join("\n\n"))] });
+	const posts = mock.calls().filter(({ args }) => args.includes("POST"));
+	assert.equal(posts.length, 4);
+	assert.deepEqual(posts.map(({ input }) => JSON.parse(input).body), findings);
+	assert.ok(posts.every(({ input }) => JSON.parse(input).body.match(/^### \[/gm).length === 1));
+});
+
+test("partial publication stops at the failed comment and reports confirmed progress without retrying", async (t) => {
+	const third = "### [Nit] Third issue\nThird issue details.";
+	const { emit, notifications, mock, sent } = await setupPR(t, ["yes", "yes", "yes"], { mock: { failPostAt: 2 } });
+	await emit("agent_end", { messages: [assistant(`${FINDING}\n\n${LOW_FINDING}\n\n${third}`)] });
+	const posts = mock.calls().filter(({ args }) => args.includes("POST"));
+	assert.equal(posts.length, 2, "The third issue must not be attempted after an error");
+	assert.deepEqual(posts.map(({ input }) => JSON.parse(input).body), [FINDING, LOW_FINDING]);
+	assert.equal(notifications.at(-1).level, "error");
+	assert.match(notifications.at(-1).message, /Could not confirm PR comment 2\/3/);
+	assert.match(notifications.at(-1).message, /1 comment\(s\) confirmed posted/);
+	assert.match(notifications.at(-1).message, /Check the PR before retrying/);
+	await emit("agent_end", { messages: [assistant(FINDING)] });
+	assert.equal(mock.calls().filter(({ args }) => args.includes("POST")).length, 2);
+	assert.equal(sent.length, 1);
+});
+
 test("GitHub API failure starts no review", async (t) => {
 	const { notifications } = await setupPR(t, [], { expectedSent: 0, mock: { failRead: true } });
 	assert.match(notifications.at(-1).message, /mock GitHub error/);
@@ -517,4 +548,66 @@ test("a second command does not overwrite an active review", async (t) => {
 	await commands.get("review").handler(PR_URL, ctx);
 	assert.equal(sent.length, 1);
 	assert.match(notifications.at(-1).message, /already in progress/);
+});
+
+function assertGenericReviewQuality(text) {
+	assert.match(text, /comments and docstrings on every added or modified function/);
+	assert.match(text, /accuracy and concision/);
+	assert.match(text, /non-obvious intent, invariants, preconditions, and concurrency assumptions/);
+	assert.match(text, /project-specific behavior, contracts, edge cases, or plausible regressions/);
+	assert.match(text, /Add\/Get wrappers that directly forward to an array/);
+	assert.match(text, /Simple tests are still valuable when they protect real project logic/);
+}
+
+function assertDatadogReviewQuality(text) {
+	assert.match(text, /Runtime observability/);
+	assert.match(text, /new logic such as a cache or resolver/);
+	assert.match(text, /existing metrics/);
+	assert.match(text, /label cardinality bounded and hot-path overhead low/);
+	assert.match(text, /Event field exposure/);
+	assert.match(text, /serialized in reported events and\/or exposed to SECL rules/);
+	assert.match(text, /intentional internal-only or sensitive fields/);
+	assert.match(text, /Do not require serialization or SECL exposure without a concrete consumer need/);
+}
+
+for (const mode of ["local", "PR"]) {
+	test(`${mode} reviews include generic quality checks but not Datadog-specific requirements in other repositories`, async (t) => {
+		const result = mode === "PR" ? await setupPR(t) : await setup(t, undefined, {
+			beforeReview: ({ git }) => git("remote", "add", "origin", "https://github.com/Example/repo.git"),
+		});
+		const prompt = result.sent[0].text;
+		assertGenericReviewQuality(prompt);
+		assert.ok(!prompt.includes("Runtime observability"));
+		assert.ok(!prompt.includes("Event field exposure"));
+		assert.ok(!prompt.includes("SECL"));
+	});
+}
+
+for (const remote of ["https://github.com/DataDog/datadog-agent.git", "git@github.com:datadog/datadog-agent.git"]) {
+	test(`Datadog reviews include Agent-wide criteria outside pkg/security via ${remote}`, async (t) => {
+		const { sent } = await setup(t, undefined, {
+			contextCwd: (cwd) => join(cwd, "subdir"),
+			beforeReview: ({ cwd, git }) => {
+				mkdirSync(join(cwd, "subdir"));
+				git("remote", "add", "origin", "https://github.com/Example/repo.git");
+				git("remote", "add", "upstream", remote);
+			},
+		});
+		const prompt = sent[0].text;
+		assertGenericReviewQuality(prompt);
+		assertDatadogReviewQuality(prompt);
+		assert.ok(prompt.indexOf("Runtime observability") < prompt.indexOf("For changes under pkg/security/"), "Agent-wide checks must not be limited to the security checklist");
+	});
+}
+
+test("standalone skills preserve the generic/Datadog criteria boundary", () => {
+	const generic = readFileSync(new URL("../skills/review-generic/SKILL.md", import.meta.url), "utf8");
+	const datadog = readFileSync(new URL("../skills/review-datadog-agent/SKILL.md", import.meta.url), "utf8");
+	assertGenericReviewQuality(generic);
+	assertGenericReviewQuality(datadog);
+	assertDatadogReviewQuality(datadog);
+	assert.ok(!generic.includes("Runtime observability"));
+	assert.ok(!generic.includes("Event field exposure"));
+	assert.ok(!generic.includes("SECL"));
+	assert.ok(datadog.indexOf("Runtime observability") < datadog.indexOf("## Additional `pkg/security/` review criteria"));
 });

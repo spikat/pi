@@ -58,6 +58,16 @@ Analyze the in-scope changes for:
 - security or data-loss risks;
 - maintainability, test coverage, and other relevant concerns.
 
+### Function comments and documentation
+
+- Review comments and docstrings on every added or modified function for accuracy and concision; flag stale descriptions of behavior, parameters, return values, and side effects.
+- Check that non-obvious intent, invariants, preconditions, and concurrency assumptions are explained where needed. Do not demand comments that merely restate self-explanatory code.
+
+### Test value
+
+- Assess whether added or modified tests protect project-specific behavior, contracts, edge cases, or plausible regressions, with assertions that would catch a meaningful defect.
+- Flag redundant tests that only mirror the implementation or re-test a standard collection, such as Add/Get wrappers that directly forward to an array without adding a project-specific contract. Simple tests are still valuable when they protect real project logic.
+
 Use the diff, change surface, and commit context as evidence. Do not manufacture a finding merely because a category exists in this checklist.
 
 ## Required output
