@@ -4,23 +4,44 @@ A Pi extension that adds the following command:
 
 ```text
 /review
+/review https://github.com/DataDog/datadog-agent/pull/55843
 ```
 
-It runs a code review of the current branch by analyzing only:
+In local-fix mode, it runs a code review of the current branch by analyzing only:
 
 - committed changes on the current branch compared with a detected baseline (`origin/HEAD`, `origin/main`, `origin/master`, `main`, then `master`);
 - staged index changes, applied on top of `HEAD`.
 
 Unstaged and untracked working-tree changes are intentionally excluded from both the Git input and the review scope. The command stops rather than reviewing a committed range when it cannot determine a baseline.
 
-## Test execution
+## Review options
 
-At the start of every interactive review, the extension asks whether to:
+Without an argument, an interactive `/review` asks for two independent choices:
 
-- run all tests relevant to the in-scope changes (typically when reviewing your own working branch); or
-- skip test execution (typically when reviewing someone else's branch that CI has already validated).
+1. **Tests:** run all tests relevant to the in-scope changes, or skip test execution.
+2. **Finding handling:** `Fix locally` (the existing fix/validation workflow), or `Comment on the PR` (asks for a GitHub PR URL).
 
-When tests are selected, the review asks the agent to determine and run every relevant test, then report each command and outcome. When skipped, the agent may inspect test files and recommend validation, but it must not run tests; recognized test-runner commands are also blocked while the review is generated. In non-interactive modes, test execution defaults to skipped.
+The first item in each dialog is the default. If the last commit's author matches the current Git user, the defaults are **run tests + fix locally**. Otherwise, the defaults are **skip tests + comment on the PR**. Identity is compared using the last commit's author email and `git config user.email` (case-insensitive), falling back to the author name and `user.name` when email comparison is unavailable. Both choices remain independently overridable.
+
+Passing a PR URL directly bypasses both setup dialogs and selects **skip tests + comment on the PR** automatically:
+
+```text
+/review https://github.com/DataDog/datadog-agent/pull/55843
+```
+
+When tests are selected, the review asks the agent to determine and run every relevant test, then report each command and outcome. When skipped, the agent may inspect test files and recommend validation, but it must not run tests; recognized test-runner commands are also blocked while the review is generated. Without a UI, `/review` defaults to skipped tests and local mode; a PR URL still selects PR mode, but no comments are posted without interactive finding selection.
+
+## PR comment mode
+
+This mode requires the **GitHub CLI (`gh`)**, authenticated for `github.com` with permission to read the PR and submit a review, plus working Git access to the repository. Run the command inside a checkout with a GitHub remote matching the repository in the PR URL. HTTPS and SSH remotes are supported, including PRs whose source branch is in a fork.
+
+The extension reads the PR head and target branch from GitHub, runs `git fetch` against the matching remote to retrieve the PR head and target, and reviews the PR head against its merge base with the target branch—not the locally detected default branch. If the current checkout is not already at the PR head, it runs `git checkout --detach` at that commit. Commit or stash local changes (including untracked files) first: the extension refuses to switch a dirty checkout. The checkout is left at the reviewed commit; return to your previous branch with `git switch -` when needed.
+
+Only committed PR changes are in scope. Staged, unstaged, and untracked changes are excluded, even when already on the PR head. The agent is instructed not to modify files or publish comments; direct `edit` and `write` tool calls are blocked during the PR review.
+
+After the agent finishes, each structured finding is presented with a `yes`/`no` choice to post a PR comment rather than generate a fix. Nothing is sent while these decisions are being collected. Once every finding has been processed, the selected findings are grouped into the body of **one GitHub `COMMENT` review**, tied to the reviewed commit, and submitted in one API call. This is a general review comment, not inline comments, an approval, or a request for changes.
+
+If no findings are selected, nothing is posted. Cancelling a finding dialog discards the entire pending batch. Submission errors are reported without automatic retries, to avoid duplicate reviews; check the PR before retrying.
 
 Diffs are rendered per file (up to 12,000 characters per file and 50,000 characters per change set), while the full changed-file list is retained. When a limit is reached, patches are prioritized for `pkg/security/`, tests, build constraints, Go module metadata, rules, and configuration files. The prompt also includes a change-surface summary: added, deleted, renamed, test, Go-module, and build-constraint changes.
 
@@ -67,9 +88,9 @@ For a checkout with any configured remote ending in `datadog/datadog-agent` (SSH
 
 Findings are requested in severity order (`Critical`, `High`, `Medium`, `Low`, `Nit`). Each finding should include affected file(s)/line(s) where available, evidence, impact, confidence, trigger conditions, a recommended fix, and concrete validation. Relevant findings are labeled as false negative, false positive, event loss, privilege/security boundary, or performance under load. Speculative concerns cannot be rated `Critical` or `High` without evidence and a plausible execution path.
 
-The extension waits for the agent to finish the review before opening fix dialogs. Interim commentary and tool calls are not findings. Only severity-labeled findings in the final response are offered for correction; unstructured output remains visible in the conversation without being turned into an issue.
+The extension waits for the agent to finish the review before opening finding dialogs. Interim commentary and tool calls are not findings. Only severity-labeled findings in the final response are offered for correction or publication; unstructured output remains visible in the conversation without being turned into an issue.
 
-Once the review is generated, the extension processes findings one at a time:
+In local-fix mode, once the review is generated, the extension processes findings one at a time:
 
 1. choose `yes` or `no` to generate a targeted fix;
 2. if you choose `yes`, the assistant generates and applies a fix only for that finding;
@@ -111,7 +132,7 @@ Then run:
 
 ## Pi Web
 
-When `@spikat/pi-web` is loaded in the same Pi process, `/review` can also be invoked from the local dashboard. The review output streams to the dashboard; the finding-by-finding fix decisions continue to use Pi's terminal UI.
+When `@spikat/pi-web` is loaded in the same Pi process, `/review` (including a PR URL argument) can also be invoked from the local dashboard. The review output streams to the dashboard; setup and finding-by-finding decisions continue to use Pi's terminal UI.
 
 ## Development tests
 
@@ -122,4 +143,4 @@ npm ci --legacy-peer-deps
 npm test
 ```
 
-The tests use temporary Git repositories and mocked Pi dialogs, so no running Pi session or host peer installation is required.
+The tests use temporary Git repositories, mocked Pi dialogs, and an offline fake GitHub CLI. They cover both modes, author-based defaults, PR fetch/checkout and target-branch scope, batch publication, cancellation, failures, and the existing fix/validation lifecycle. No running Pi session, GitHub access, or host peer installation is required.
