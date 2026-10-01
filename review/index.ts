@@ -276,11 +276,7 @@ function parseFindings(reviewText: string): string[] {
 	if (headingMatches.length > 0) return headingMatches;
 
 	const bulletPattern = new RegExp(`^(?:[-*]|\\d+\\.)\\s+(?:\\*\\*)?(?:${severity})(?:\\*\\*)?[:\\s-].*(?:\\n(?![-*]\\s+(?:(?:\\*\\*)?(?:${severity})(?:\\*\\*)?[:\\s-])|\\d+\\.\\s+(?:(?:\\*\\*)?(?:${severity})(?:\\*\\*)?[:\\s-])).*)*`, "gim");
-	const bulletMatches = reviewText.match(bulletPattern)?.map((finding) => finding.trim()).filter(Boolean) ?? [];
-	if (bulletMatches.length > 0) return bulletMatches;
-
-	if (/no (substantial )?findings|no issues found|nothing significant/i.test(reviewText)) return [];
-	return reviewText ? [reviewText] : [];
+	return reviewText.match(bulletPattern)?.map((finding) => finding.trim()).filter(Boolean) ?? [];
 }
 
 function chooseFindingAction(ctx: ExtensionContext, finding: string, index: number, total: number): Promise<string | null | undefined> {
@@ -421,15 +417,20 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
-	pi.on("message_end", async (event, ctx) => {
-		const text = extractAssistantText(event.message);
+	pi.on("agent_end", async (event, ctx) => {
+		// A message can contain commentary followed by tool calls. Wait for the
+		// whole agent run so neither review decisions nor fix validation interrupt it.
+		const message = [...event.messages].reverse().find((message) => message.role === "assistant");
+		if (!message || message.role !== "assistant") return;
+		if (message.stopReason === "error" || message.stopReason === "aborted" || message.stopReason === "toolUse") return;
+		const text = extractAssistantText(message);
 		if (!text) return;
 
 		if (state.mode === "awaiting-review") {
 			const findings = parseFindings(text);
 			if (findings.length === 0) {
 				state = { mode: "idle" };
-				if (ctx.hasUI) ctx.ui.notify("No review findings to process", "info");
+				if (ctx.hasUI) ctx.ui.notify("No structured review findings to process; see the assistant response", "info");
 				return;
 			}
 

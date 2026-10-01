@@ -67,11 +67,13 @@ For a checkout with any configured remote ending in `datadog/datadog-agent` (SSH
 
 Findings are requested in severity order (`Critical`, `High`, `Medium`, `Low`, `Nit`). Each finding should include affected file(s)/line(s) where available, evidence, impact, confidence, trigger conditions, a recommended fix, and concrete validation. Relevant findings are labeled as false negative, false positive, event loss, privilege/security boundary, or performance under load. Speculative concerns cannot be rated `Critical` or `High` without evidence and a plausible execution path.
 
+The extension waits for the agent to finish the review before opening fix dialogs. Interim commentary and tool calls are not findings. Only severity-labeled findings in the final response are offered for correction; unstructured output remains visible in the conversation without being turned into an issue.
+
 Once the review is generated, the extension processes findings one at a time:
 
 1. choose `yes` or `no` to generate a targeted fix;
 2. if you choose `yes`, the assistant generates and applies a fix only for that finding;
-3. after the fix, choose `ok` or `iterate with a prompt`;
+3. after the agent finishes applying the fix (including its tool calls), choose `ok` or `iterate with a prompt`;
 4. when you choose `ok`, the extension moves to the next finding.
 
 You retain control over each decision.
@@ -110,3 +112,14 @@ Then run:
 ## Pi Web
 
 When `@spikat/pi-web` is loaded in the same Pi process, `/review` can also be invoked from the local dashboard. The review output streams to the dashboard; the finding-by-finding fix decisions continue to use Pi's terminal UI.
+
+## Development tests
+
+From the `review/` directory:
+
+```bash
+npm ci --legacy-peer-deps
+npm test
+```
+
+The tests use temporary Git repositories and mocked Pi dialogs, so no running Pi session or host peer installation is required.

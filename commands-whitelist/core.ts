@@ -222,27 +222,31 @@ function shellCContent(words: string[]): string | undefined {
 	return knownShell ? content : undefined;
 }
 
+function unsupportedShell(command: string): { parts: CommandPart[]; unsupported: true } {
+	return { parts: [{ original: command, words: [], displayWords: [command, "*"], dynamic: false, unsupported: true }], unsupported: true };
+}
+
 export function analyseShell(command: string): { parts: CommandPart[]; unsupported: boolean } {
-	if (/\b(function\s+[A-Za-z_]|[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\)\s*\{)/.test(command)) return { parts: [{ original: command, words: [], displayWords: [command, "*"], dynamic: false, unsupported: true }], unsupported: true };
+	if (/\b(function\s+[A-Za-z_]|[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\)\s*\{)/.test(command)) return unsupportedShell(command);
 	const lists = splitShellLists(command);
-	if (!lists) return { parts: [{ original: command, words: [], displayWords: [command, "*"], dynamic: false, unsupported: true }], unsupported: true };
+	if (!lists) return unsupportedShell(command);
 	const parts: CommandPart[] = [];
 	for (const original of lists) {
 		const trimmed = original.trim();
 		if ((trimmed.startsWith("(") && trimmed.endsWith(")")) || (trimmed.startsWith("{") && trimmed.endsWith("}"))) {
 			const inner = trimmed.slice(1, -1).replace(/;\s*$/, "");
 			const result = analyseShell(inner);
-			if (result.unsupported) return result;
+			if (result.unsupported) return unsupportedShell(command);
 			parts.push(...result.parts);
 			continue;
 		}
 		const clean = stripRedirections(original).trim();
 		let parsed = shellWords(clean);
-		if (!parsed || !parsed.words.length) return { parts: [{ original: command, words: [], displayWords: [command, "*"], dynamic: false, unsupported: true }], unsupported: true };
+		if (!parsed || !parsed.words.length) return unsupportedShell(command);
 		// `do`, `then`, and `else` introduce a real command after a control-list
 		// separator; analyse that body rather than discarding the whole segment.
 		if (["do", "then", "else"].includes(parsed.words[0]!) && parsed.words.length > 1) parsed = shellWords(clean.replace(/^\s*(?:do|then|else)\s+/, ""));
-		if (!parsed || !parsed.words.length) return { parts: [{ original: command, words: [], displayWords: [command, "*"], dynamic: false, unsupported: true }], unsupported: true };
+		if (!parsed || !parsed.words.length) return unsupportedShell(command);
 		const first = parsed.words[0]!;
 		const pythonScript = isPythonScript(parsed.words);
 		if (!CONTROL_WORDS.has(first) && first !== "for" && first !== "while" && first !== "if" && first !== "case") {
@@ -253,16 +257,19 @@ export function analyseShell(command: string): { parts: CommandPart[]; unsupport
 		// text in arguments or attempt to reason about the script it will execute.
 		if (pythonScript) continue;
 		const nested = nestedExpressions(original);
-		if (!nested) return { parts: [{ original: command, words: [], displayWords: [command, "*"], dynamic: false, unsupported: true }], unsupported: true };
+		if (!nested) return unsupportedShell(command);
 		for (const content of nested) {
 			const result = analyseShell(content);
-			if (result.unsupported) return result;
+			// The child source is only a fragment of the command the user is asked
+			// to approve. If it cannot be analysed, the safe fallback is the whole
+			// command, never that fragment alone.
+			if (result.unsupported) return unsupportedShell(command);
 			parts.push(...result.parts);
 		}
 		const shellContent = shellCContent(parsed.words);
 		if (shellContent !== undefined) {
 			const result = analyseShell(shellContent);
-			if (result.unsupported) return result;
+			if (result.unsupported) return unsupportedShell(command);
 			parts.push(...result.parts);
 		}
 	}

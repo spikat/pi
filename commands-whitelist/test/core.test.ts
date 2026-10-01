@@ -40,6 +40,15 @@ test("does not expose arithmetic expansions as subcommands", () => {
   ]);
 });
 
+test("falls back to the complete command when a nested fragment cannot be parsed", () => {
+  const command = 'review_dir=$(< /tmp/dd-agent-review-dir); mkdir -p "$review_dir/pkg/util/ktime"; git show HEAD:pkg/util/ktime/resolver.go > "$review_dir/pkg/util/ktime/resolver.go"';
+  const result = analyseShell(command);
+  assert.equal(result.unsupported, true);
+  assert.equal(result.parts.length, 1);
+  assert.equal(result.parts[0]?.original, command);
+  assert.deepEqual(result.parts[0]?.displayWords, [command, "*"]);
+});
+
 test("recurses through shell -c and process substitutions", () => {
   const shell = analyseShell('sh -c "grep foo bar.txt|sort"');
   assert.equal(shell.parts.length, 3);
