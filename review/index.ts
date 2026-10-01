@@ -324,8 +324,10 @@ async function preparePullRequest(pr: PullRequest, cwd: string, remoteUrls: stri
 	}
 	await runGit(["check-ref-format", `refs/heads/${baseRef}`], cwd);
 	const currentHead = await runGit(["rev-parse", "HEAD"], cwd);
-	if (currentHead !== head && await runGit(["status", "--porcelain"], cwd)) {
-		throw new Error("Commit or stash local changes before checking out the PR branch");
+	// Untracked files alone do not make a checkout unsafe. Git will reject the
+	// checkout below if the PR would overwrite one; never force or clean it.
+	if (currentHead !== head && await runGit(["status", "--porcelain", "--untracked-files=no"], cwd)) {
+		throw new Error("Commit or stash tracked local changes before checking out the PR branch");
 	}
 
 	const refRoot = `refs/remotes/pi-review/${repository}/pr-${pr.number}`;

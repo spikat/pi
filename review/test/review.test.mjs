@@ -350,16 +350,54 @@ test("PR review excludes staged and unstaged changes when already on PR head", a
 	assert.match(git("status", "--porcelain"), /staged.go/);
 });
 
-test("PR checkout refuses a dirty tree without changing HEAD", async (t) => {
-	const { notifications, git, mock } = await setupPR(t, [], {
-		expectedSent: 0,
+test("PR checkout allows unrelated untracked files with a clean tracked tree", async (t) => {
+	const { cwd, git, mock, sent } = await setupPR(t, [], {
 		afterMock: ({ cwd, git }) => {
 			git("checkout", "main");
 			writeFileSync(join(cwd, "untracked.txt"), "keep me\n");
+			assert.equal(git("status", "-suno"), "");
+			assert.match(git("status", "--porcelain"), /\?\? untracked.txt/);
+		},
+	});
+	assert.equal(git("rev-parse", "HEAD"), mock.head);
+	assert.equal(readFileSync(join(cwd, "untracked.txt"), "utf8"), "keep me\n");
+	assert.ok(!sent[0].text.includes("untracked.txt"));
+});
+
+for (const staged of [false, true]) {
+	test(`PR checkout refuses ${staged ? "staged" : "unstaged"} tracked changes without changing HEAD`, async (t) => {
+		const { cwd, notifications, git, mock } = await setupPR(t, [], {
+			expectedSent: 0,
+			afterMock: ({ cwd, git }) => {
+				git("checkout", "main");
+				writeFileSync(join(cwd, "parser.go"), "// keep tracked changes\n");
+				if (staged) git("add", "parser.go");
+			},
+		});
+		assert.equal(git("rev-parse", "HEAD"), mock.base);
+		assert.equal(readFileSync(join(cwd, "parser.go"), "utf8"), "// keep tracked changes\n");
+		assert.match(notifications.at(-1).message, /Commit or stash tracked local changes/);
+	});
+}
+
+test("PR checkout refuses to overwrite a conflicting untracked file", async (t) => {
+	const { cwd, notifications, git, mock } = await setupPR(t, [], {
+		expectedSent: 0,
+		beforeMock: ({ cwd, git }) => {
+			writeFileSync(join(cwd, "pr-only.go"), "package pr\n");
+			git("add", "pr-only.go");
+			git("commit", "-m", "file added by PR");
+		},
+		afterMock: ({ cwd, git }) => {
+			git("checkout", "main");
+			writeFileSync(join(cwd, "pr-only.go"), "// keep untracked content\n");
+			assert.equal(git("status", "-suno"), "");
 		},
 	});
 	assert.equal(git("rev-parse", "HEAD"), mock.base);
-	assert.match(notifications.at(-1).message, /Commit or stash/);
+	assert.equal(readFileSync(join(cwd, "pr-only.go"), "utf8"), "// keep untracked content\n");
+	assert.equal(notifications.at(-1).level, "error");
+	assert.match(notifications.at(-1).message, /pr-only.go/);
 });
 
 test("PR head changing during fetch stops the review", async (t) => {
