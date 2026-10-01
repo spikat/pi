@@ -52,11 +52,13 @@ function threeSentences(value: string): string | undefined {
 	const compact = value.replace(/\s+/g, " ").replace(/^[#>*\-\s]+/, "").trim();
 	if (!compact) return undefined;
 	const sentences = compact.match(/[^.!?]+(?:[.!?]+|$)/g) ?? [compact];
-	return sentences.slice(0, 3).join(" ").trim() || undefined;
+	return sentences.slice(0, 3).map((sentence) => sentence.trim()).join(" ") || undefined;
 }
-async function commandSummary(ctx: ExtensionContext, command: string): Promise<string | undefined> {
+async function commandSummary(ctx: ExtensionContext, command: string): Promise<string> {
+	const unavailable = (reason: string) => `Explanation unavailable: ${reason}`;
 	const model = ctx.model;
-	if (!model || !ctx.modelRegistry.hasConfiguredAuth(model) || ctx.signal?.aborted) return undefined;
+	if (!model) return unavailable("no active model.");
+	if (ctx.signal?.aborted) return unavailable("generation cancelled.");
 	const task = currentTask(ctx);
 	const prompt = [
 		"Write a very short explanation for a shell-command approval dialog.",
@@ -67,9 +69,22 @@ async function commandSummary(ctx: ExtensionContext, command: string): Promise<s
 		"<shell-command>", command.slice(0, 8_000), "</shell-command>",
 	].join("\n");
 	try {
-		const response = await ctx.modelRegistry.complete(model, { messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] }, { cacheRetention: "none", maxTokens: 120, signal: ctx.signal });
-		return threeSentences(response.content.filter((block): block is { type: "text"; text: string } => block.type === "text" && typeof block.text === "string").map((block) => block.text).join("\n"));
-	} catch { return undefined; }
+		const context = { messages: [{ role: "user" as const, content: [{ type: "text" as const, text: prompt }], timestamp: Date.now() }] };
+		// The output budget includes reasoning tokens, not just the short visible
+		// explanation. Use the provider-neutral API so reasoning is clamped to the
+		// model's supported levels and virtual models can route the request.
+		const options = { cacheRetention: "none" as const, maxTokens: 2_048, signal: ctx.signal };
+		type Registry = ExtensionContext["modelRegistry"];
+		const registry = ctx.modelRegistry as Registry & {
+			streamSimple?: (model: NonNullable<ExtensionContext["model"]>, context: Parameters<Registry["complete"]>[1], streamOptions: typeof options & { reasoning: "minimal" }) => { result(): ReturnType<Registry["complete"]> };
+		};
+		const response = registry.streamSimple
+			? await registry.streamSimple(model, context, { ...options, reasoning: "minimal" }).result()
+			: await registry.complete(model, context, { ...options, ...(model.reasoning ? { reasoningEffort: "low" as const } : {}) });
+		if (response.stopReason === "aborted" || ctx.signal?.aborted) return unavailable("generation cancelled.");
+		if (response.stopReason === "error") return unavailable("the model request failed.");
+		return threeSentences(messageText(response.content)) ?? unavailable("the model returned no explanation.");
+	} catch { return unavailable(ctx.signal?.aborted ? "generation cancelled." : "the model request failed."); }
 }
 
 class PromptLine {
