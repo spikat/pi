@@ -2,7 +2,7 @@ EXTENSIONS := commit-msg pr-description review commands-whitelist ask web
 OTP ?=
 PUBLISH_ARGS := --access public $(if $(OTP),--otp=$(OTP))
 
-.PHONY: publish
+.PHONY: publish test install-deps
 
 # Pass a current 2FA code with: make publish OTP=123456
 # A granular npm token configured with 2FA bypass does not require OTP.
@@ -25,3 +25,20 @@ publish:
 			fi; \
 		fi; \
 	done
+
+# Install dependencies for every package.
+install-deps:
+	@set -e; \
+	for extension in $(EXTENSIONS); do \
+		printf '\nInstalling dependencies for %s...\n' "$$extension"; \
+		npm --prefix "$$extension" install; \
+	done
+
+# Run every package's tests, even if an earlier suite fails.
+test:
+	@status=0; \
+	for extension in $(EXTENSIONS); do \
+		printf '\nTesting %s...\n' "$$extension"; \
+		npm --prefix "$$extension" test || status=1; \
+	done; \
+	exit $$status

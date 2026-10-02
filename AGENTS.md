@@ -4,6 +4,15 @@ This repository contains independent npm/Pi packages in `ask/`,
 `commands-whitelist/`, `commit-msg/`, `pr-description/`, `review/`, and `web/`.
 Each directory has its own `package.json`; there is no shared package version.
 
+## Running tests
+
+Run `make install-deps` from the repository root to install dependencies for all
+packages before the first test run.
+
+Run `make test` from the repository root to execute all packages' test suites.
+Use this command to validate changes; it runs every suite and returns a nonzero
+exit status if any suite fails.
+
 ## Required package version updates
 
 Whenever you modify a package (code, skills, documentation, tests, dependencies,
@@ -34,8 +43,8 @@ work. Apply this automatically; do not wait for the user to request a bump.
   ```
 
   Alternatively, edit the manifest and existing lockfile versions directly.
-- Run the affected package's existing tests when available, check the version
-  fields agree, and verify new runtime files are included in its npm package
+- Run `make test` from the repository root, check the version fields agree, and
+  verify new runtime files are included in the affected package's npm package
   (for example with `npm pack --dry-run`).
 - Mention the affected package and its old/new versions in the final response.
 - Do not publish, create commits, or create Git tags unless explicitly asked.
