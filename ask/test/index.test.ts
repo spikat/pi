@@ -12,6 +12,7 @@ function createExtension() {
 	const userMessages: string[] = [];
 	const initialTools = ["read", "bash", "edit", "write", "grep", "some_extension_tool"];
 	let command: Command | undefined;
+	let activeTools = initialTools;
 
 	askExtension({
 		on(event: string, handler: Handler) {
@@ -22,9 +23,10 @@ function createExtension() {
 			command = registered;
 		},
 		getActiveTools() {
-			return initialTools;
+			return activeTools;
 		},
 		setActiveTools(tools: string[]) {
+			activeTools = tools;
 			toolSelections.push(tools);
 		},
 		sendUserMessage(message: string) {
@@ -65,7 +67,7 @@ test("/ask allows inspection while blocking changes and restores the tool select
 
 	const toolCall = extension.handlers.get("tool_call")!;
 	assert.equal(toolCall({ toolName: "read", input: { path: "README.md" } }), undefined);
-	assert.equal(toolCall({ toolName: "bash", input: { command: "git diff --stat" } }), undefined);
+	assert.equal(toolCall({ toolName: "bash", input: { command: "git diff --no-ext-diff --no-textconv --stat" } }), undefined);
 	assert.equal(toolCall({ toolName: "bash", input: { command: "find . -name '*.ts'" } }), undefined);
 	assert.deepEqual(toolCall({ toolName: "write", input: { path: "README.md" } }), {
 		block: true,
