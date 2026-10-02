@@ -6,6 +6,7 @@ export const matchesKey = (data, key) => data === key;
 export class Editor {
 	focused = false;
 	text = "";
+	setText(text) { this.text = text; }
 	render() { return this.text.split("\n"); }
 	invalidate() {}
 	handleInput(data) { this.onSubmit?.(data); }

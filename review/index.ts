@@ -2,6 +2,8 @@ import { execFile } from "node:child_process";
 import { getMarkdownTheme, isToolCallEventType, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, SelectList, Spacer, Text } from "@earendil-works/pi-tui";
 import { ReviewUI } from "./web-ui.js";
+import { parseInlineFinding, postInlineFinding, validateInlineFindings } from "./inline.js";
+import { ALL_COMMENTS, CHECK_COMMENTS, JUST_ME, checkPrompt, chooseCommentActions, currentGitLogin, loadCommentThreads, parseAssessment, publishCommentAction, type Assessment, type CommentThread } from "./comments.js";
 
 const MAX_SECTION_CHARS = 50000;
 const MAX_FILE_DIFF_CHARS = 12000;
@@ -287,7 +289,7 @@ function isTestRunnerCommand(command: string): boolean {
 
 type TestExecution = "run" | "skip";
 type ReviewAction = "fix" | "comment";
-type ReviewOptions = { testExecution: TestExecution; action: ReviewAction };
+type ReviewOptions = { testExecution: TestExecution; action: ReviewAction | "check" };
 type PullRequest = { owner: string; repo: string; number: number; url: string };
 type PreparedPullRequest = PullRequest & { head: string; base: string; cwd: string };
 
@@ -317,7 +319,8 @@ async function chooseReviewOptions(ctx: ExtensionContext, ui: ReviewUI): Promise
 	const ownBranch = await isOwnBranch(ctx.cwd);
 	// The first item is selected by default in both TUI and RPC dialogs.
 	const tests = await ui.select(ctx, "Run tests during this review?", ownBranch
-		? [RUN_RELEVANT_TESTS, SKIP_TESTS] : [SKIP_TESTS, RUN_RELEVANT_TESTS]);
+		? [RUN_RELEVANT_TESTS, SKIP_TESTS, CHECK_COMMENTS] : [SKIP_TESTS, RUN_RELEVANT_TESTS, CHECK_COMMENTS]);
+	if (tests === CHECK_COMMENTS) return { testExecution: "skip", action: "check" };
 	const action = tests && await ui.select(ctx, "How should review findings be handled?", ownBranch
 		? [FIX_LOCALLY, COMMENT_ON_PR] : [COMMENT_ON_PR, FIX_LOCALLY]);
 	if (!tests || !action) {
@@ -362,14 +365,6 @@ async function preparePullRequest(pr: PullRequest, cwd: string, remoteUrls: stri
 	return { ...pr, head, base, cwd };
 }
 
-async function postPullRequestComment(pr: PreparedPullRequest, finding: string): Promise<void> {
-	// A separate COMMENT review per finding keeps each issue independently
-	// discussable while preserving its association with the reviewed commit.
-	await runCommand("gh", ["api", "--hostname", "github.com", "--method", "POST",
-		`repos/${pr.owner}/${pr.repo}/pulls/${pr.number}/reviews`, "--input", "-"], pr.cwd,
-		JSON.stringify({ commit_id: pr.head, event: "COMMENT", body: finding }));
-}
-
 function parseFindings(reviewText: string): string[] {
 	const severity = "Critical|High|Medium|Low|Nit";
 	const headingPattern = new RegExp(`^###\\s+\\[(${severity})\\][^\\n]*(?:\\n(?!###\\s+\\[(?:${severity})\\]).*)*`, "gim");
@@ -381,7 +376,7 @@ function parseFindings(reviewText: string): string[] {
 }
 
 function chooseFindingAction(ctx: ExtensionContext, ui: ReviewUI, finding: string, index: number, total: number, action: ReviewAction = "fix"): Promise<string | null | undefined> {
-	const question = action === "comment" ? "Post a comment on the PR for this issue?" : "Generate a fix for this issue?";
+	const question = action === "comment" ? "Post an inline thread on the PR for this issue?" : "Generate a fix for this issue?";
 	const prompt = `Finding ${index + 1}/${total}\n\n${finding}\n\n${question}`;
 	const terminal = (signal: AbortSignal) => ctx.ui.custom<string | null>((tui, theme, _keybindings, done) => {
 		let finished = false;
@@ -439,6 +434,8 @@ function chooseFindingAction(ctx: ExtensionContext, ui: ReviewUI, finding: strin
 
 type ReviewState =
 	| { mode: "idle" }
+	| { mode: "awaiting-check"; pullRequest: PreparedPullRequest; threads: CommentThread[]; context: CommentThread[]; assessments: Assessment[]; index: number; identity: string; interrupted?: boolean }
+	| { mode: "check-interaction" }
 	| { mode: "awaiting-review"; testExecution: TestExecution; pullRequest?: PreparedPullRequest; interrupted?: boolean }
 	| { mode: "review-interaction"; findings: string[]; index: number }
 	| { mode: "awaiting-fix-validation"; findings: string[]; index: number };
@@ -463,7 +460,14 @@ export default function (pi: ExtensionAPI) {
 		}
 		const selected: string[] = [];
 		for (let index = 0; index < findings.length; index++) {
-			const choice = await chooseFindingAction(ctx, ui, findings[index]!, index, findings.length, "comment");
+			let display = findings[index]!;
+			try {
+				const inline = parseInlineFinding(display);
+				display = `${inline.body}\n\nInline thread: ${inline.path}:${inline.line} (${inline.side})`;
+			} catch (error) {
+				display += `\n\nCannot publish inline: ${error instanceof Error ? error.message : String(error)}. Select no to skip; selecting yes will prevent publication of the entire batch.`;
+			}
+			const choice = await chooseFindingAction(ctx, ui, display, index, findings.length, "comment");
 			if (ui.isDisposed) return;
 			if (!choice) {
 				state = { mode: "idle" };
@@ -473,21 +477,29 @@ export default function (pi: ExtensionAPI) {
 			if (choice === "yes") selected.push(findings[index]!);
 		}
 		let posted = 0;
+		let submitting = false;
 		try {
 			if (selected.length > 0) {
-				// Collect every decision first, then publish one comment per issue.
-				for (const finding of selected) {
+				const inlineFindings = selected.map(parseInlineFinding);
+				await validateInlineFindings(runCommand, pr, inlineFindings);
+				// Collect and validate every decision first, then create one thread per issue.
+				for (const finding of inlineFindings) {
 					if (ui.isDisposed) return;
-					await postPullRequestComment(pr, finding);
+					submitting = true;
+					await postInlineFinding(runCommand, pr, finding);
 					posted++;
 				}
 				if (ui.isDisposed) return;
-				ctx.ui.notify(`Posted ${posted} separate PR comment(s) on ${pr.url}`, "info");
+				ctx.ui.notify(`Posted ${posted} separate inline PR thread(s) on ${pr.url}`, "info");
 			} else {
 				ctx.ui.notify("No PR comments selected; nothing sent", "info");
 			}
 		} catch (error) {
-			ctx.ui.notify(`Could not confirm PR comment ${posted + 1}/${selected.length}: ${error instanceof Error ? error.message : String(error)}. ${posted} comment(s) confirmed posted; subsequent comments were not attempted. Check the PR before retrying.`, "error");
+			if (ui.isDisposed) return;
+			const detail = error instanceof Error ? error.message : String(error);
+			ctx.ui.notify(submitting
+				? `Could not confirm PR comment ${posted + 1}/${selected.length}: ${detail}. ${posted} comment(s) confirmed posted as inline threads; subsequent comments were not attempted. Check the PR before retrying.`
+				: `Could not prepare inline PR threads: ${detail}. No PR comments sent; nothing was published.`, "error");
 		} finally {
 			if (!ui.isDisposed) state = { mode: "idle" };
 		}
@@ -567,6 +579,16 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.on("tool_call", (event) => {
+		if (state.mode === "awaiting-check") {
+			if (event.toolName === "read") return;
+			const command = isToolCallEventType("bash", event) ? event.input.command : undefined;
+			// Limit shell access to committed-snapshot inspection. Even a shell
+			// fallback must not publish on GitHub or alter the working tree.
+			if (command && /^git(?:\s+-C\s+(?:"[^"]*"|'[^']*'|\S+))?\s+(?:show|diff|log|ls-tree|cat-file|rev-parse)\s/.test(command)
+				&& !/[;|&<>`$\n\r]/.test(command)
+				&& !/--(?:output|ext-diff|textconv|no-index|filters)\b/.test(command.replace(/['"\\]/g, ""))) return;
+			return { block: true, reason: "Comment checking is read-only: use read or a single git show/diff/log/ls-tree/cat-file/rev-parse command. No tests, mutations, or GitHub actions." };
+		}
 		if (state.mode !== "awaiting-review") return;
 		if (state.pullRequest && (event.toolName === "edit" || event.toolName === "write")) {
 			return { block: true, reason: "PR comment mode is read-only. Do not apply local fixes." };
@@ -594,12 +616,32 @@ export default function (pi: ExtensionAPI) {
 			if (!message || message.role !== "assistant") return;
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
 				// Preserve the review for an agent retry, but allow an explicit /review restart.
-				if (state.mode === "awaiting-review") state = { ...state, interrupted: true };
+				if (state.mode === "awaiting-review" || state.mode === "awaiting-check") state = { ...state, interrupted: true };
 				return;
 			}
 			if (message.stopReason === "toolUse") return;
 			const text = extractAssistantText(message);
 			if (!text) return;
+
+			if (state.mode === "awaiting-check") {
+				const check = state;
+				try {
+					check.assessments.push(parseAssessment(text, check.threads[check.index]!));
+					check.index++;
+					if (check.index < check.threads.length) {
+						pi.sendUserMessage(`${check.identity}\n${checkPrompt(check.pullRequest, check.threads[check.index]!, check.context, check.index, check.threads.length)}`, { deliverAs: "followUp" });
+						return;
+					}
+					state = { mode: "check-interaction" };
+					await processCommentCheck(ctx, ui, check);
+				} catch (error) {
+					if (!ui.isDisposed) {
+						state = { mode: "idle" };
+						ctx.ui.notify(`Comment check stopped: ${error instanceof Error ? error.message : String(error)}`, "error");
+					}
+				}
+				return;
+			}
 
 			if (state.mode === "awaiting-review") {
 				const pullRequest = state.pullRequest;
@@ -624,6 +666,76 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
+	async function generateCommentCheck(ctx: ExtensionContext, ui: ReviewUI, cwd: string, pr?: PullRequest, justMe = false): Promise<void> {
+		if (!ui.available(ctx)) {
+			ctx.ui.notify("Checking comments requires an interactive UI to validate replies and resolution actions", "warning");
+			return;
+		}
+		if (!pr) {
+			const url = await ui.input(ctx, "GitHub PR URL", "https://github.com/owner/repo/pull/123");
+			if (!url?.trim() || ui.isDisposed) { ctx.ui.notify("Comment check cancelled", "info"); return; }
+			pr = parsePullRequest(url);
+		}
+		if (!justMe) {
+			const scope = await ui.select(ctx, "Whose comments should be checked?", [ALL_COMMENTS, JUST_ME]);
+			if (!scope || ui.isDisposed) { ctx.ui.notify("Comment check cancelled", "info"); return; }
+			justMe = scope === JUST_ME;
+		}
+		const remoteUrls = await tryGit(["config", "--get-regexp", "^remote\\..*\\.url$"], cwd);
+		if (ui.isDisposed) return;
+		const pullRequest = await preparePullRequest(pr, cwd, remoteUrls);
+		if (ui.isDisposed) return;
+		let login: string | undefined;
+		try { login = await currentGitLogin(runCommand, pullRequest); }
+		catch (error) {
+			if (justMe) throw error;
+			ctx.ui.notify("GitHub identity could not be mapped from Git; checking all authors without assuming which comments are yours", "warning");
+		}
+		const context = await loadCommentThreads(runCommand, pullRequest);
+		// A thread belongs to its initial author, not every participant replying.
+		const threads = justMe && login ? context.filter((thread) => thread.comments[0]!.author.toLowerCase() === login.toLowerCase()) : context;
+		if (ui.isDisposed) return;
+		if (!threads.length) { ctx.ui.notify("No matching PR comments to check", "info"); return; }
+		const gitEmail = await tryGit(["config", "user.email"], cwd);
+		const gitName = await tryGit(["config", "user.name"], cwd);
+		if (ui.isDisposed) return;
+		const identity = `Current Git user: ${gitName ?? "unknown"} <${gitEmail ?? "unknown"}>${login ? `; GitHub @${login}` : "; GitHub identity unknown: do not assume any comment author is the current user"}. Checking ${threads.length} comments (including resolved threads).`;
+		state = { mode: "awaiting-check", pullRequest, threads, context, assessments: [], index: 0, identity };
+		ctx.ui.notify(`Checking ${threads.length} PR comment(s)${justMe ? ` opened by @${login}` : " from all authors"}…`, "info");
+		pi.sendUserMessage(`${identity}\n${checkPrompt(pullRequest, threads[0]!, context, 0, threads.length)}`);
+	}
+
+	async function processCommentCheck(ctx: ExtensionContext, ui: ReviewUI, check: Extract<ReviewState, { mode: "awaiting-check" }>): Promise<void> {
+		const selected = await chooseCommentActions(ctx, ui, check.threads, check.assessments);
+		if (ui.isDisposed) return;
+		if (!selected) {
+			state = { mode: "idle" };
+			ctx.ui.notify("Comment check cancelled; no GitHub actions sent", "info");
+			return;
+		}
+		let completed = 0;
+		try {
+			if (selected.length) {
+				// Reject stale assessments rather than resolving a thread that gained
+				// replies or changed state while the user was choosing actions.
+				const latest = JSON.parse(await runCommand("gh", ["api", "--hostname", "github.com", `repos/${check.pullRequest.owner}/${check.pullRequest.repo}/pulls/${check.pullRequest.number}`], check.pullRequest.cwd));
+				if (latest.head?.sha !== check.pullRequest.head) throw new Error("PR head changed; run /review check again");
+				const refreshed = await loadCommentThreads(runCommand, check.pullRequest);
+				if (JSON.stringify(refreshed) !== JSON.stringify(check.context)) throw new Error("PR comments or resolution state changed; run /review check again");
+				for (const action of selected) {
+					if (ui.isDisposed) return;
+					await publishCommentAction(runCommand, check.pullRequest, action);
+					completed++;
+				}
+			}
+			if (!ui.isDisposed) ctx.ui.notify(`Comment check completed: ${completed} action(s) confirmed`, "info");
+		} catch (error) {
+			if (!ui.isDisposed) ctx.ui.notify(`Comment actions stopped: ${error instanceof Error ? error.message : String(error)}. ${completed}/${selected.length} action(s) confirmed; an action can partially succeed (reply sent but unresolve failed). Check the PR before retrying; no automatic retry.`, "error");
+		} finally {
+			if (!ui.isDisposed) state = { mode: "idle" };
+		}
+	}
+
 	async function generateReview(ctx: ExtensionContext, args: string, ui: ReviewUI): Promise<void> {
 		let workspaceRoot: string;
 		try {
@@ -633,10 +745,22 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		const checkCommand = args.trim().match(/^check(?:\s|$)/i);
+		if (checkCommand) {
+			const rest = args.trim().slice(5).trim();
+			const justMe = /(?:^|\s)--just-me$/.test(rest);
+			const value = justMe ? rest.replace(/(?:^|\s)--just-me$/, "").trim() : rest;
+			await generateCommentCheck(ctx, ui, workspaceRoot, value ? parsePullRequest(value) : undefined, justMe);
+			return;
+		}
 		let pr: PullRequest | undefined;
 		if (args.trim()) pr = parsePullRequest(args);
 		const options = pr ? { testExecution: "skip" as const, action: "comment" as const } : await chooseReviewOptions(ctx, ui);
 		if (!options) return;
+		if (options.action === "check") {
+			await generateCommentCheck(ctx, ui, workspaceRoot);
+			return;
+		}
 		const { testExecution } = options;
 		if (options.action === "comment" && !pr) {
 			const url = await ui.input(ctx, "GitHub PR URL", "https://github.com/owner/repo/pull/123");
@@ -677,7 +801,7 @@ export default function (pi: ExtensionAPI) {
 				: "Perform a code review of committed branch changes relative to the baseline and staged index changes.",
 			pullRequest ? "Scope boundary: review only the supplied committed PR range. Staged, unstaged, and untracked changes are excluded. Read committed file snapshots rather than working-tree files."
 				: "Scope boundary: base the review only on the committed range and staged changes supplied below. Do not inspect, mention, or draw conclusions from unstaged or untracked working-tree changes; they are intentionally excluded.",
-			pullRequest ? "PR comment mode: do not modify local files or post anything to GitHub. The extension will ask the user which findings to publish and submit the selected comments together after all decisions."
+			pullRequest ? "PR comment mode: do not modify local files or post anything to GitHub. The extension will ask the user which findings to publish as separate inline review threads after all decisions. Never use general PR comments as a fallback."
 				: "Staged changes are applied on top of the current branch HEAD.",
 			testExecution === "run"
 				? "Test execution is requested: determine and run every test relevant to the in-scope changes. Do not substitute unrelated broad tests for relevant focused coverage."
@@ -698,6 +822,7 @@ export default function (pi: ExtensionAPI) {
 			"- Sort findings by criticality: Critical, High, Medium, Low, Nit.",
 			"- Use one third-level heading per finding, exactly in this format: ### [Severity] Short title.",
 			"- For each finding, include affected file(s) and line(s) when they can be inferred, concrete evidence, impact, confidence (High/Medium/Low), trigger or preconditions, a recommended fix when possible, and specific validation.",
+			pullRequest ? '- Inside every finding, include exactly one inline location marker: <!-- pi-review-inline {"path":"relative/file.go","line":123,"side":"RIGHT"} -->. Use an exact repository-relative path from the PR diff, one positive line number, and RIGHT for additions/context or LEFT for deleted lines (old-side line number). For renamed files use the destination path on either side. Select the most relevant commentable line in a diff hunk; do not invent a line outside the diff or choose an unrelated line just to allow publication. The marker is removed before posting. Findings without a valid anchor cannot be published; explain any such limitation.' : undefined,
 			"- Label applicable findings with one or more of: false negative, false positive, event loss, privilege/security boundary, performance under load.",
 			"- Do not rate a speculative concern Critical or High without concrete evidence and a plausible execution path.",
 			"- Do not apply fixes automatically. Leave the final decision to the user on a case-by-case basis.",
@@ -765,7 +890,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function runReview(ctx: ExtensionContext, args = ""): Promise<void> {
-		if (!preparing && state.mode === "awaiting-review" && state.interrupted) state = { mode: "idle" };
+		if (!preparing && (state.mode === "awaiting-review" || state.mode === "awaiting-check") && state.interrupted) state = { mode: "idle" };
 		if (preparing || state.mode !== "idle") {
 			ctx.ui.notify("A review is already in progress", "warning");
 			return;
@@ -786,7 +911,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 	}
-	pi.registerCommand("review", { description: "Review changes: choose tests and local fixes or PR comments; accepts a GitHub PR URL", handler: async (args, ctx) => { await ctx.waitForIdle(); await runReview(ctx, args); } });
+	pi.registerCommand("review", { description: "Review changes or check existing comments: /review check URL [--just-me]", handler: async (args, ctx) => { await ctx.waitForIdle(); await runReview(ctx, args); } });
 	registerWebCommand("review", async (args) => {
 		if (!current) return;
 		if (!current.isIdle()) { current.ui.notify("Wait for the agent to finish before starting a review", "warning"); return; }

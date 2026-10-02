@@ -88,9 +88,9 @@ export class ReviewUI {
 		return this.decide(ctx, { kind: "input", title, data: { placeholder } }, (signal) => ctx.ui.input(title, placeholder, { signal }));
 	}
 
-	editor(ctx: ExtensionContext, title: string): Promise<string | undefined> {
-		return this.decide(ctx, { kind: "input", title, data: { multiline: true } }, (signal) => {
-			if (!this.bridge() || ctx.mode !== "tui") return ctx.ui.editor(title);
+	editor(ctx: ExtensionContext, title: string, initial = ""): Promise<string | undefined> {
+		return this.decide(ctx, { kind: "input", title, initial, data: { multiline: true } }, (signal) => {
+			if (!this.bridge() || ctx.mode !== "tui") return ctx.ui.editor(title, initial);
 			return ctx.ui.custom<string | undefined>((tui, theme, _keys, done) => {
 				const editor = new Editor(tui, {
 					borderColor: (text) => theme.fg("accent", text),
@@ -102,6 +102,7 @@ export class ReviewUI {
 						noMatch: (text) => theme.fg("warning", text),
 					},
 				});
+				editor.setText(initial);
 				let finished = false;
 				const finish = (value: string | undefined) => {
 					if (finished) return;

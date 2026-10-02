@@ -21,8 +21,8 @@ const FIX_LOCALLY = "Fix locally";
 const COMMENT_ON_PR = "Comment on the PR";
 const PR_URL = "https://github.com/Example/repo/pull/42";
 const INTRO = "I’ll review the baseline-to-HEAD changes using committed file snapshots only. I won’t inspect working-tree changes or run tests.";
-const FINDING = "### [High] Missing bounds check\nFile: parser.go:12. Out-of-range input causes a panic. Validate the index first.";
-const LOW_FINDING = "### [Low] Missing regression test\nAdd a test for invalid input.";
+const FINDING = "### [High] Missing bounds check\nFile: parser.go:2. Out-of-range input causes a panic. Validate the index first.";
+const LOW_FINDING = "### [Low] Missing regression test\nFile: parser.go:2. Add a test for invalid input.";
 
 function assistant(text, stopReason = "stop", extraContent = []) {
 	return { role: "assistant", content: [{ type: "text", text }, ...extraContent], stopReason };
@@ -58,6 +58,7 @@ async function setup(t, choices = [SKIP_TESTS, FIX_LOCALLY], options = {}) {
 	const sent = [];
 	const answers = [...choices];
 	const inputs = [...(options.inputs ?? [])];
+	const edits = [...(options.edits ?? [])];
 	const ctx = {
 		cwd: options.contextCwd?.(cwd) ?? cwd, mode: options.mode ?? "rpc", hasUI: options.hasUI ?? true,
 		isIdle: () => true,
@@ -77,6 +78,11 @@ async function setup(t, choices = [SKIP_TESTS, FIX_LOCALLY], options = {}) {
 				assert.ok(answers.length > 0, "Unexpected custom finding dialog");
 				component.handleInput(answers.shift() ?? "\x1b");
 			}),
+			editor: async (prompt, initial) => {
+				dialogs.push({ prompt, initial });
+				assert.ok(edits.length > 0, `Unexpected editor: ${prompt}`);
+				return edits.shift();
+			},
 			input: async (prompt, placeholder) => {
 				dialogs.push({ prompt, placeholder });
 				assert.ok(inputs.length > 0, `Unexpected input: ${prompt}`);
@@ -146,14 +152,32 @@ function mockPullRequest(t, { cwd, git }, options = {}) {
 import { readFileSync, appendFileSync } from "node:fs";
 const args = process.argv.slice(2);
 const post = args.includes("POST");
-const input = post ? readFileSync(0, "utf8") : "";
+const input = args.includes("--input") ? readFileSync(0, "utf8") : "";
 appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args, input }) + "\\n");
 const postAttempts = readFileSync(${JSON.stringify(logPath)}, "utf8").trim().split("\\n")
   .map((line) => JSON.parse(line)).filter(({ args }) => args.includes("POST")).length;
 if (${!!options.failRead} && !post || post && (${!!options.failPost} || postAttempts === ${options.failPostAt ?? 0})) {
   console.error("mock GitHub error"); process.exit(1);
 }
-console.log(JSON.stringify(post ? { id: 1 } : ${JSON.stringify(metadata)}));
+let result = post ? { id: 1 } : ${JSON.stringify(metadata)};
+const threads = ${JSON.stringify(options.threads ?? [])};
+if (args.includes("graphql")) {
+  const request = JSON.parse(input);
+  if (request.query.startsWith("mutation")) {
+    if (${!!options.failMutation}) { console.error("mutation failed"); process.exit(1); }
+    result = { data: { mutation: { id: "ok" } } };
+  } else result = { data: { repository: { pullRequest: { reviewThreads: { nodes: threads, pageInfo: { hasNextPage: false } } } } } };
+} else if (args.some((arg) => /\\/files\\?/.test(arg))) result = ${JSON.stringify(options.files ?? [{ filename: "parser.go", patch: "@@ -1 +1,2 @@\n package parser\n+// changed" }])};
+else if (args.some((arg) => /\\/(reviews|comments)\\?/.test(arg))) result = [];
+else if (args.includes("user")) result = { login: "Test", email: "test@example.com" };
+else if (args.some((arg) => arg.startsWith("users/"))) result = { login: args.find((arg) => arg.startsWith("users/")).slice(6) };
+const history = readFileSync(${JSON.stringify(logPath)}, "utf8").trim().split("\\n").map(JSON.parse);
+if (${!!options.changeHeadOnRecheck} && args.includes("repos/Example/repo/pulls/42")
+    && history.filter(({ args }) => args.includes("repos/Example/repo/pulls/42")).length > 1) result.head.sha = "f".repeat(40);
+if (${!!options.changeThreadsOnRecheck} && args.includes("graphql") && !JSON.parse(input).query.startsWith("mutation")
+    && history.filter(({ args, input }) => args.includes("graphql") && !JSON.parse(input).query.startsWith("mutation")).length > 1)
+  result.data.repository.pullRequest.reviewThreads.nodes[0].isResolved = !threads[0].isResolved;
+console.log(JSON.stringify(result));
 `, { mode: 0o755 });
 	return {
 		head, base,
@@ -306,22 +330,23 @@ test("interactive PR mode asks for URL and honors requested tests", async (t) =>
 	assert.equal((await emit("tool_call", { toolName: "edit", input: {} })).block, true);
 });
 
-test("PR comments are posted separately after all decisions and never generate fixes", async (t) => {
+test("inline PR threads are posted separately after all decisions and never generate fixes", async (t) => {
 	const { dialogs, sent, mock, emit, ctx, notifications } = await setupPR(t, ["yes", "no", "yes"]);
 	ctx.beforeAnswer = () => assert.equal(mock.calls().filter(({ args }) => args.includes("POST")).length, 0);
-	const third = "### [Nit] Unclear name\nRename this variable.";
+	const third = "### [Nit] Unclear name\nFile: parser.go:2. Rename this variable.";
 	await emit("agent_end", { messages: [assistant(`${FINDING}\n\n${LOW_FINDING}\n\n${third}`)] });
 	assert.equal(dialogs.length, 3);
-	assert.ok(dialogs.every(({ prompt }) => prompt.includes("Post a comment on the PR")));
+	assert.ok(dialogs.every(({ prompt }) => prompt.includes("Post an inline thread on the PR")));
+	assert.ok(dialogs.every(({ prompt }) => prompt.includes("Inline thread: parser.go:2 (RIGHT)")));
 	assert.equal(sent.length, 1, "No fix or validation follow-up");
 	const posts = mock.calls().filter(({ args }) => args.includes("POST"));
 	assert.equal(posts.length, 2);
-	assert.ok(posts.every(({ args }) => args.includes("repos/Example/repo/pulls/42/reviews")));
+	assert.ok(posts.every(({ args }) => args.includes("repos/Example/repo/pulls/42/comments")));
 	assert.deepEqual(posts.map(({ input }) => JSON.parse(input)), [
-		{ commit_id: mock.head, event: "COMMENT", body: FINDING },
-		{ commit_id: mock.head, event: "COMMENT", body: third },
+		{ commit_id: mock.head, body: FINDING, path: "parser.go", line: 2, side: "RIGHT" },
+		{ commit_id: mock.head, body: third, path: "parser.go", line: 2, side: "RIGHT" },
 	]);
-	assert.match(notifications.at(-1).message, /Posted 2 separate PR comment/);
+	assert.match(notifications.at(-1).message, /Posted 2 separate inline PR thread/);
 	await emit("agent_end", { messages: [assistant(FINDING)] });
 	assert.equal(mock.calls().filter(({ args }) => args.includes("POST")).length, 2, "Cannot post twice");
 });
@@ -435,8 +460,8 @@ test("PR publication failure is reported and never automatically retried", async
 	assert.equal(sent.length, 1);
 });
 
-test("four selected issues produce four separate comments, never one combined body", async (t) => {
-	const findings = [FINDING, LOW_FINDING, "### [Low] Third issue\nThird issue details.", "### [Nit] Fourth issue\nFourth issue details."];
+test("four selected issues produce four separate inline threads, never one combined body", async (t) => {
+	const findings = [FINDING, LOW_FINDING, "### [Low] Third issue\nFile: parser.go:2. Third issue details.", "### [Nit] Fourth issue\nFile: parser.go:2. Fourth issue details."];
 	const { emit, mock } = await setupPR(t, ["yes", "yes", "yes", "yes"]);
 	await emit("agent_end", { messages: [assistant(findings.join("\n\n"))] });
 	const posts = mock.calls().filter(({ args }) => args.includes("POST"));
@@ -446,7 +471,7 @@ test("four selected issues produce four separate comments, never one combined bo
 });
 
 test("partial publication stops at the failed comment and reports confirmed progress without retrying", async (t) => {
-	const third = "### [Nit] Third issue\nThird issue details.";
+	const third = "### [Nit] Third issue\nFile: parser.go:2. Third issue details.";
 	const { emit, notifications, mock, sent } = await setupPR(t, ["yes", "yes", "yes"], { mock: { failPostAt: 2 } });
 	await emit("agent_end", { messages: [assistant(`${FINDING}\n\n${LOW_FINDING}\n\n${third}`)] });
 	const posts = mock.calls().filter(({ args }) => args.includes("POST"));
@@ -504,7 +529,7 @@ test("TUI PR finding dialog renders markdown and asks to comment, not fix", asyn
 	const { dialogs, emit, mock } = await setupPR(t, ["yes"], { mode: "tui" });
 	await emit("agent_end", { messages: [assistant(FINDING)] });
 	assert.equal(dialogs[0].custom, true);
-	assert.match(dialogs[0].prompt, /Post a comment on the PR/);
+	assert.match(dialogs[0].prompt, /Post an inline thread on the PR/);
 	assert.ok(dialogs[0].prompt.includes(FINDING));
 	assert.ok(!dialogs[0].prompt.includes("Generate a fix"));
 	assert.equal(mock.calls().filter(({ args }) => args.includes("POST")).length, 1);
@@ -706,4 +731,201 @@ test("standalone skills preserve the generic/Datadog criteria boundary", () => {
 	assert.ok(!generic.includes("Event field exposure"));
 	assert.ok(!generic.includes("SECL"));
 	assert.ok(datadog.indexOf("Runtime observability") < datadog.indexOf("## Additional `pkg/security/` review criteria"));
+});
+
+const CHECK = "Check comments";
+const ALL = "All authors";
+const ME = "Just me";
+const RESOLVE_COMMENT = "1 / Fixed — resolve if still open";
+const REPLY_COMMENT = "2 / Discussion — edit and send a reply";
+const REOPEN_COMMENT = "3 / Not fully fixed — edit reply and unresolve if resolved";
+const LEAVE_COMMENT = "Leave unchanged / skip";
+function ghThread(id = "T1", author = "Test", resolved = false) {
+	return { id, isResolved: resolved, isOutdated: resolved, path: "parser.go", line: 2,
+		comments: { nodes: [{ id: `${id}-C1`, author: { login: author }, body: "Please fix the bounds check", url: `${PR_URL}#discussion_${id}`,
+			createdAt: "2026-01-01", updatedAt: "2026-01-01", diffHunk: "@@ parser @@", commit: { oid: "a".repeat(40) } },
+			{ id: `${id}-C2`, author: { login: "Other" }, body: "Updated, please check", url: `${PR_URL}#reply_${id}`, createdAt: "2026-01-02", updatedAt: "2026-01-02" }],
+			pageInfo: { hasNextPage: false } } };
+}
+function checked(id, status, reply = "") {
+	return assistant(`\`\`\`json\n${JSON.stringify({ threadId: id, status, evidence: "parser.go:2 — inspected the current committed code and replies", reply })}\n\`\`\``);
+}
+function mutations(mock) {
+	return mock.calls().filter(({ args, input }) => args.includes("graphql") && JSON.parse(input).query.startsWith("mutation"))
+		.map(({ input }) => JSON.parse(input));
+}
+
+test("check is offered in the first menu, requests URL and scope, and resolves after analysis", async (t) => {
+	const { dialogs, emit, sent, mock } = await setupPR(t, [CHECK, ALL, RESOLVE_COMMENT], {
+		args: "", inputs: [PR_URL], mock: { threads: [ghThread()] },
+	});
+	assert.ok(dialogs[0].options.includes(CHECK));
+	assert.equal(dialogs[2].prompt, "Whose comments should be checked?");
+	assert.match(sent[0].text, /Check PR comments: 1\/1/);
+	assert.match(sent[0].text, /original comment's commit\/diffHunk/);
+	await emit("agent_end", { messages: [checked("T1", "fixed")] });
+	assert.equal(dialogs[3].options[0], RESOLVE_COMMENT);
+	assert.match(dialogs[3].prompt, /Updated, please check/);
+	assert.match(mutations(mock)[0].query, /resolveReviewThread/);
+});
+
+test("check URL analyzes all authors and resolved threads, batches edited replies and unresolve", async (t) => {
+	const { emit, mock, dialogs, sent, ctx } = await setupPR(t, [ALL, REPLY_COMMENT, "Send", REOPEN_COMMENT, "Send"], {
+		args: `check ${PR_URL}`, edits: ["Edited first reply", "Edited second reply"],
+		mock: { threads: [ghThread("T1", "SomeoneElse"), ghThread("T2", "Test", true)] },
+	});
+	assert.match(sent[0].text, /SomeoneElse/);
+	await emit("agent_end", { messages: [checked("T1", "discussion", "First draft")] });
+	assert.equal(sent.length, 2);
+	assert.equal(dialogs.length, 1, "No action dialogs before every comment was assessed");
+	assert.match(sent[1].text, /Check PR comments: 2\/2/);
+	ctx.beforeAnswer = () => assert.equal(mutations(mock).length, 0);
+	await emit("agent_end", { messages: [checked("T2", "partial", "Second draft")] });
+	assert.equal(dialogs[1].options[0], REPLY_COMMENT);
+	assert.equal(dialogs[2].initial, "First draft");
+	assert.equal(dialogs[4].options[0], REOPEN_COMMENT);
+	const changes = mutations(mock);
+	assert.equal(changes.length, 3);
+	assert.deepEqual(changes.slice(0, 2).map(({ variables }) => variables.body), ["Edited first reply", "Edited second reply"]);
+	assert.match(changes[2].query, /unresolveReviewThread/);
+	assert.equal(changes[2].variables.id, "T2");
+});
+
+test("just me uses the Git identity and only initial thread authors, not reply authors", async (t) => {
+	const own = ghThread("T1", "test", true), other = ghThread("T2", "SomeoneElse");
+	other.comments.nodes[1].author.login = "Test";
+	const { emit, sent, mock, dialogs } = await setupPR(t, [LEAVE_COMMENT], {
+		args: `check ${PR_URL} --just-me`, mock: { threads: [own, other] },
+	});
+	assert.equal(dialogs.length, 0);
+	assert.match(sent[0].text, /GitHub @Test/);
+	assert.match(sent[0].text, /Check PR comments: 1\/1/);
+	assert.ok(!sent[0].text.includes("SomeoneElse"));
+	await emit("agent_end", { messages: [checked("T1", "fixed")] });
+	assert.equal(dialogs[0].options[0], LEAVE_COMMENT, "Already resolved fixed threads default to no action");
+	assert.equal(mutations(mock).length, 0);
+});
+
+test("the Just me dialog can map an explicitly configured GitHub login", async (t) => {
+	const { sent } = await setupPR(t, [ME], {
+		args: `check ${PR_URL}`, mock: { threads: [ghThread("T1", "CustomLogin")] },
+		afterMock: ({ git }) => git("config", "github.user", "CustomLogin"),
+	});
+	assert.match(sent[0].text, /GitHub @CustomLogin/);
+});
+
+test("check mode guards tests, writes, publishing tools, and shell mutations but allows git inspection", async (t) => {
+	const { emit } = await setupPR(t, [ALL], { args: `check ${PR_URL}`, mock: { threads: [ghThread()] } });
+	for (const command of ["go test ./...", "gh api graphql", "git show HEAD; touch bad", "git diff --output=bad", "git diff --out'put'=bad", "git cat-file --filters HEAD:parser.go", "git checkout main"]) {
+		assert.equal((await emit("tool_call", { toolName: "bash", input: { command } })).block, true);
+	}
+	for (const toolName of ["write", "edit", "github_publish", "powershell"]) {
+		assert.equal((await emit("tool_call", { toolName, input: {} })).block, true);
+	}
+	for (const command of ["git show HEAD:parser.go", "git diff HEAD~1 HEAD -- parser.go", "git log -p -- parser.go", "git -C '/tmp/checkout with spaces' show HEAD:parser.go"]) {
+		assert.equal(await emit("tool_call", { toolName: "bash", input: { command } }), undefined);
+	}
+});
+
+test("cancelling any check decision discards the whole pending batch", async (t) => {
+	const { emit, mock, notifications } = await setupPR(t, [ALL, RESOLVE_COMMENT, undefined], {
+		args: `check ${PR_URL}`, mock: { threads: [ghThread("T1"), ghThread("T2")] },
+	});
+	await emit("agent_end", { messages: [checked("T1", "fixed")] });
+	await emit("agent_end", { messages: [checked("T2", "fixed")] });
+	assert.equal(mutations(mock).length, 0);
+	assert.match(notifications.at(-1).message, /cancelled; no GitHub actions/);
+});
+
+test("invalid model JSON or a mismatched thread id never triggers actions", async (t) => {
+	const { emit, mock, notifications, dialogs } = await setupPR(t, [ALL], { args: `check ${PR_URL}`, mock: { threads: [ghThread()] } });
+	await emit("agent_end", { messages: [checked("unknown", "fixed")] });
+	assert.equal(mutations(mock).length, 0);
+	assert.equal(dialogs.length, 1);
+	assert.match(notifications.at(-1).message, /Invalid comment assessment/);
+});
+
+test("check failure stops mutations without retrying and reports progress", async (t) => {
+	const { emit, mock, notifications } = await setupPR(t, [ALL, RESOLVE_COMMENT], {
+		args: `check ${PR_URL}`, mock: { threads: [ghThread()], failMutation: true },
+	});
+	await emit("agent_end", { messages: [checked("T1", "fixed")] });
+	assert.match(notifications.at(-1).message, /0\/1 action\(s\) confirmed/);
+	await emit("agent_end", { messages: [checked("T1", "fixed")] });
+	assert.equal(mutations(mock).length, 1);
+});
+
+test("browser comment checking preserves reply drafts and Markdown and sends the edited response", async (t) => {
+	const browser = browserAnswers([ALL, REPLY_COMMENT, "Browser edited reply\nMore details", "Send"]);
+	const { emit, mock, dialogs } = await setupPR(t, [], {
+		args: `check ${PR_URL}`, hasUI: false, web: true, bridge: browser.bridge, mock: { threads: [ghThread()] },
+	});
+	await emit("agent_end", { messages: [checked("T1", "discussion", "Proposed reply")] });
+	assert.equal(browser.dialogs[1].data.markdown, true);
+	assert.equal(browser.dialogs[2].initial, "Proposed reply");
+	assert.equal(mutations(mock)[0].variables.body, "Browser edited reply\nMore details");
+	assert.equal(dialogs.length, 0);
+	assert.equal(browser.statuses.at(-1), "idle");
+});
+
+for (const change of ["changeHeadOnRecheck", "changeThreadsOnRecheck"]) {
+	test(`stale check (${change}) publishes nothing`, async (t) => {
+		const { emit, mock, notifications } = await setupPR(t, [ALL, RESOLVE_COMMENT], {
+			args: `check ${PR_URL}`, mock: { threads: [ghThread()], [change]: true },
+		});
+		await emit("agent_end", { messages: [checked("T1", "fixed")] });
+		assert.equal(mutations(mock).length, 0);
+		assert.match(notifications.at(-1).message, /changed; run \/review check again/);
+	});
+}
+
+test("empty PR comment lists finish without starting the agent", async (t) => {
+	const { notifications } = await setupPR(t, [ALL], { args: `check ${PR_URL}`, expectedSent: 0 });
+	assert.match(notifications.at(-1).message, /No matching PR comments/);
+});
+
+function inlineFinding(body, path = "parser.go", line = 2, side = "RIGHT") {
+	return `${body}\n<!-- pi-review-inline ${JSON.stringify({ path, line, side })} -->`;
+}
+
+test("PR review requests inline anchors; publication strips metadata and anchors deleted lines on LEFT", async (t) => {
+	const body = "### [High] Deleted guard\nRestore this validation.";
+	const { sent, emit, mock, dialogs } = await setupPR(t, ["yes"], {
+		mock: { files: [{ filename: "renamed parser.go", previous_filename: "parser.go", patch: "@@ -1,2 +1 @@\n package parser\n-// guard" }] },
+	});
+	assert.match(sent[0].text, /pi-review-inline/);
+	assert.match(sent[0].text, /separate inline review threads/);
+	await emit("agent_end", { messages: [assistant(inlineFinding(body, "renamed parser.go", 2, "LEFT"))] });
+	assert.match(dialogs[0].prompt, /Inline thread: renamed parser.go:2 \(LEFT\)/);
+	assert.ok(!dialogs[0].prompt.includes("pi-review-inline"));
+	const posts = mock.calls().filter(({ args }) => args.includes("POST"));
+	assert.equal(posts.length, 1);
+	assert.deepEqual(JSON.parse(posts[0].input), { commit_id: mock.head, body, path: "renamed parser.go", line: 2, side: "LEFT" });
+	assert.ok(!mock.calls().some(({ args }) => args.includes("repos/Example/repo/pulls/42/reviews")));
+});
+
+for (const [name, invalid] of [
+	["missing location", "### [Low] Unanchored issue\nNo file specified."],
+	["non-diff line", inlineFinding("### [Low] Bad line\nDetails.", "parser.go", 50)],
+	["wrong side", inlineFinding("### [Low] Bad side\nDetails.", "parser.go", 2, "LEFT")],
+]) {
+	test(`invalid selected finding (${name}) stops the entire inline batch before any post`, async (t) => {
+		const { emit, mock, notifications } = await setupPR(t, ["yes", "yes"]);
+		await emit("agent_end", { messages: [assistant(`${FINDING}\n\n${invalid}`)] });
+		assert.equal(mock.calls().filter(({ args }) => args.includes("POST")).length, 0);
+		assert.match(notifications.at(-1).message, /No PR comments sent/);
+	});
+}
+
+test("an invalid declined finding does not prevent valid inline threads from being posted", async (t) => {
+	const { emit, mock } = await setupPR(t, ["yes", "no"]);
+	await emit("agent_end", { messages: [assistant(`${FINDING}\n\n### [Low] Unanchored issue\nNo location.`)] });
+	assert.equal(mock.calls().filter(({ args }) => args.includes("POST")).length, 1);
+});
+
+test("PR head changing before inline publication rejects all selected findings", async (t) => {
+	const { emit, mock, notifications } = await setupPR(t, ["yes"], { mock: { changeHeadOnRecheck: true } });
+	await emit("agent_end", { messages: [assistant(FINDING)] });
+	assert.equal(mock.calls().filter(({ args }) => args.includes("POST")).length, 0);
+	assert.match(notifications.at(-1).message, /PR head changed/);
 });

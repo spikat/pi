@@ -5,6 +5,8 @@ A Pi extension that adds the following command:
 ```text
 /review
 /review https://github.com/DataDog/datadog-agent/pull/55843
+/review check https://github.com/DataDog/datadog-agent/pull/55843
+/review check https://github.com/DataDog/datadog-agent/pull/55843 --just-me
 ```
 
 In local-fix mode, it runs a code review of the current branch by analyzing only:
@@ -16,10 +18,12 @@ Unstaged and untracked working-tree changes are intentionally excluded from both
 
 ## Review options
 
-Without an argument, an interactive `/review` asks for two independent choices:
+Without an argument, an interactive `/review` starts with:
 
-1. **Tests:** run all tests relevant to the in-scope changes, or skip test execution.
-2. **Finding handling:** `Fix locally` (the existing fix/validation workflow), or `Comment on the PR` (asks for a GitHub PR URL).
+1. **Tests / mode:** run all tests relevant to the in-scope changes, skip test execution, or **Check comments**.
+2. For a new review, **finding handling:** `Fix locally` (the existing fix/validation workflow), or `Comment on the PR` (asks for a GitHub PR URL).
+
+**Check comments** instead asks for a PR URL and a scope: **All authors** (default) or **Just me**. It does not run tests or generate local fixes.
 
 The first item in each dialog is the default. If the last commit's author matches the current Git user, the defaults are **run tests + fix locally**. Otherwise, the defaults are **skip tests + comment on the PR**. Identity is compared using the last commit's author email and `git config user.email` (case-insensitive), falling back to the author name and `user.name` when email comparison is unavailable. Both choices remain independently overridable.
 
@@ -31,6 +35,36 @@ Passing a PR URL directly bypasses both setup dialogs and selects **skip tests +
 
 When tests are selected, the review asks the agent to determine and run every relevant test, then report each command and outcome. When skipped, the agent may inspect test files and recommend validation, but it must not run tests; recognized test-runner commands are also blocked while the review is generated. Without a terminal/RPC UI or an active Pi Web connection, `/review` defaults to skipped tests and local mode; a PR URL still selects PR mode, but no comments are posted without interactive finding selection.
 
+## Check existing PR comments
+
+```text
+/review check https://github.com/owner/repo/pull/123
+/review check https://github.com/owner/repo/pull/123 --just-me
+```
+
+The first command asks for **All authors** or **Just me**; `--just-me` bypasses that choice. `/review check` without a URL prompts for one. The same workflow is available through **Check comments** in the first `/review` menu, in terminal, RPC, and Pi Web.
+
+This mode uses the same GitHub CLI authentication, matching repository remote, fetch, and safe PR-head checkout as PR comment mode below. It reads **every page** of inline threads and replies, including already resolved or outdated threads, plus general PR review bodies and conversation comments (including those posted by `/review`). Resolved threads are included deliberately so an incomplete fix can be reopened. Pending, unpublished reviews are excluded.
+
+Each initial comment is assessed against the **latest committed PR code**, its original commit/diff hunk, and the replies. The agent checks whether the code actually addresses the initial concern, whether someone replied without a relevant code change, and whether the discussion requires a response or is awaiting someone else. It must not treat “resolved” or “outdated” as proof of a fix. Inspection is read-only; tests and publication tools are blocked during analysis. Comments are treated as untrusted input, not instructions.
+
+After all comments have been assessed, each is displayed with the discussion, analysis, and proposed reply. The most appropriate action is first/selected by default:
+
+1. **Fixed — resolve if still open**, for a completely addressed inline thread.
+2. **Discussion — edit and send a reply**, when the discussion needs a response.
+3. **Not fully fixed — edit reply and unresolve if resolved**, for an incomplete correction.
+4. **Leave unchanged / skip**, including already resolved complete fixes, unanswered unchanged concerns, and discussions where no useful response is needed.
+
+Replies open a multiline editor prefilled with the draft, followed by an explicit **Send / Leave unchanged** confirmation. No actions are sent until the entire set of choices has been collected. Cancelling a dialog discards the pending batch. The extension rechecks the PR head and comment/resolution snapshot before publishing, and refuses stale assessments. Publication is sequential, not atomic: a failure stops subsequent actions, reports confirmed progress, and never retries automatically. A reply may have been sent even if reopening its thread subsequently fails; inspect GitHub before retrying.
+
+**Just me** means threads **initiated** by the current Git user, not every thread they replied to. The local `git config user.email` is mapped to a GitHub login through a GitHub noreply address, a matching public/verified email of the authenticated account, or an unambiguous GitHub email search. It never silently substitutes the authenticated `gh` account when its identity does not match. If GitHub cannot expose the email mapping, configure the login explicitly:
+
+```bash
+git config github.user YOUR_GITHUB_LOGIN
+```
+
+GitHub has no resolve/unresolve flag or explicit reply relationship for general review bodies and conversation comments. Those are assessed with the general PR discussion as context, without inventing a thread association; a validated response is posted in the PR conversation referencing the original comment URL. Only inline threads can be resolved or reopened. Unknown or unavailable original code must be reported as uncertainty, not as a confirmed fix. An interactive UI is required for this mode.
+
 ## PR comment mode
 
 This mode requires the **GitHub CLI (`gh`)**, authenticated for `github.com` with permission to read the PR and submit a review, plus working Git access to the repository. Run the command inside a checkout with a GitHub remote matching the repository in the PR URL. HTTPS and SSH remotes are supported, including PRs whose source branch is in a fork.
@@ -39,7 +73,17 @@ The extension reads the PR head and target branch from GitHub, runs `git fetch` 
 
 Only committed PR changes are in scope. Staged, unstaged, and untracked changes are excluded, even when already on the PR head. The agent is instructed not to modify files or publish comments; direct `edit` and `write` tool calls are blocked during the PR review.
 
-After the agent finishes, each structured finding is presented with a `yes`/`no` choice to post a PR comment rather than generate a fix. Nothing is sent while these decisions are being collected. Once every finding has been processed, the extension publishes **one separate comment per selected finding**, in selection order. Each comment is submitted as its own GitHub `COMMENT` review tied to the reviewed commit, with one API call per issue. Findings are never combined into a single comment. These are general review comments, not inline comments, approvals, or requests for changes.
+After the agent finishes, each structured finding is presented with a `yes`/`no` choice to post an **inline PR thread** rather than generate a fix. The dialog shows the target file, line, and diff side. Nothing is sent while these decisions are being collected. Once every finding has been processed, the extension publishes **one separate inline review thread per selected finding**, in selection order, tied to the reviewed commit. Each is a new GitHub review comment attached to a diff line, with one API call per issue—not a general review body, approval, or request for changes. These threads can subsequently be resolved or reopened with `/review check`.
+
+The agent provides one location marker inside each finding:
+
+```text
+<!-- pi-review-inline {"path":"pkg/example.go","line":123,"side":"RIGHT"} -->
+```
+
+`RIGHT` uses the new-side line number for added/context lines; `LEFT` uses the old-side number for deleted lines. Renamed files use the destination path on both sides. The marker is stripped from the posted body. For compatibility, a single explicit `File: relative/path:line` is also accepted as a `RIGHT` anchor; ambiguous prose is never used to guess a location.
+
+Before sending anything, the extension validates **all selected locations** against the paginated GitHub PR file patches and checks that the PR head still matches the reviewed commit. Missing/invalid anchors, unavailable patches (for example binary or very large diffs), or a changed head stop the entire batch before publication. Unpublishable findings remain visible in the conversation and can be declined in the selection dialog. There is **no fallback to general PR comments**.
 
 If no findings are selected, nothing is posted. Cancelling a finding dialog discards the entire pending batch. Publication is sequential, not atomic: if a submission fails, the extension stops, reports which comment failed and how many preceding comments were confirmed posted, and leaves subsequent comments unattempted. It never automatically retries, to avoid duplicates; check the PR before retrying, since the failed request may still have reached GitHub.
 
@@ -146,7 +190,7 @@ Then run:
 
 ## Pi Web
 
-With `@spikat/pi-web` **0.1.6 or later** loaded in the same Pi process and `/web on` enabled, `/review` (including a PR URL argument) can be invoked from the dashboard. All decisions are available in the browser: test execution, local fixes versus PR comments, the PR URL, each finding, fix validation, and multiline iteration prompts. Findings retain their Markdown formatting.
+With `@spikat/pi-web` **0.1.6 or later** loaded in the same Pi process and `/web on` enabled, `/review` (including a PR URL argument) can be invoked from the dashboard. All decisions are available in the browser: test execution or checking existing comments, local fixes versus PR comments, the PR URL, author scope, each finding or existing thread, editable reply drafts, resolution actions, fix validation, and multiline iteration prompts. Findings retain their Markdown formatting.
 
 In TUI mode, dialogs are mirrored to the terminal and browser. The first answer or cancellation closes both views; a late response cannot trigger a second fix or comment. In RPC or browser-only modes, an active web connection uses browser dialogs without leaving an unanswered RPC dialog behind. Without an active web connection, the existing standalone terminal/RPC behavior is unchanged.
 
@@ -163,4 +207,4 @@ npm ci --legacy-peer-deps
 npm test
 ```
 
-The tests use temporary Git repositories, mocked Pi dialogs, and an offline fake GitHub CLI. They cover both modes, author-based defaults, PR fetch/checkout and target-branch scope, separate comments per finding, cancellation, partial publication failures, the existing fix/validation lifecycle, routing of generic versus Datadog-specific review criteria, browser-driven decisions, terminal/browser races, multiline iteration, and cancellation cleanup. No running Pi session, GitHub access, or host peer installation is required.
+The tests use temporary Git repositories, mocked Pi dialogs, and an offline fake GitHub CLI. They cover both modes, author-based defaults, PR fetch/checkout and target-branch scope, separate inline threads per finding, inline metadata and diff-side validation, cancellation, partial publication failures, the existing fix/validation lifecycle, routing of generic versus Datadog-specific review criteria, browser-driven decisions, terminal/browser races, multiline iteration, and cancellation cleanup. Comment-check tests additionally cover paginated threads/replies/general comments, Git-to-GitHub identity mapping, resolved threads, recommended actions, editable replies, reopening, read-only guards, stale assessments, browser drafts, and batch cancellation. No running Pi session, GitHub access, or host peer installation is required.
