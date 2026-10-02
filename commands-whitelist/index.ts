@@ -3,8 +3,11 @@ import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { analyseShell, loadStore, normalizeRule, resolveRule, ruleFor, saveStore, type CommandPart, type ResolvedRule, type RuleScope, type Store } from "./core.js";
+import { lstat, readlink, realpath } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { analyseShell, loadStore, normalizeRule, resolveRule, ruleFor, saveChanges, type CommandPart, type ResolvedRule, type RuleScope, type Store } from "./core.js";
+
+import { cancelDecisions, customDecision, waitDecision } from "./decisions.js";
 
 const NAME = "commands whitelist";
 const FILE = "commands-whitelist.json";
@@ -18,6 +21,20 @@ const WEB_BRIDGE_SYMBOL = Symbol.for("spikat.pi.web.bridge");
 function webBridge(): WebBridge | undefined { return (globalThis as Record<symbol, unknown>)[WEB_BRIDGE_SYMBOL] as WebBridge | undefined; }
 const sessionEditDirectories = new Set<string>();
 const sessionEditFiles = new Set<string>();
+async function canonicalPath(path: string, depth = 0): Promise<string> {
+	if (depth > 64) throw new Error(`${NAME}: too many unresolved path components or symlinks`);
+	try { return await realpath(path); }
+	catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		// realpath also fails for dangling links; those must not inherit lexical permissions.
+		try {
+			if ((await lstat(path)).isSymbolicLink()) return canonicalPath(resolve(dirname(path), await readlink(path)), depth + 1);
+		} catch (detailsError) { if ((detailsError as NodeJS.ErrnoException).code !== "ENOENT") throw detailsError; }
+		const parent = dirname(path);
+		if (parent === path) throw error;
+		return resolve(await canonicalPath(parent, depth + 1), basename(path));
+	}
+}
 
 function gitRoot(cwd: string): string | undefined { let current = resolve(cwd); while (true) { if (existsSync(resolve(current, ".git"))) return current; const parent = dirname(current); if (parent === current) return undefined; current = parent; } }
 function projectStorePath(cwd: string): string { return resolve(gitRoot(cwd) ?? cwd, CONFIG_DIR_NAME, FILE); }
@@ -73,14 +90,24 @@ async function commandSummary(ctx: ExtensionContext, command: string): Promise<s
 		// The output budget includes reasoning tokens, not just the short visible
 		// explanation. Use the provider-neutral API so reasoning is clamped to the
 		// model's supported levels and virtual models can route the request.
-		const options = { cacheRetention: "none" as const, maxTokens: 2_048, signal: ctx.signal };
+		const signal = ctx.signal ? AbortSignal.any([ctx.signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000);
+		const options = { cacheRetention: "none" as const, maxTokens: 2_048, signal };
 		type Registry = ExtensionContext["modelRegistry"];
 		const registry = ctx.modelRegistry as Registry & {
 			streamSimple?: (model: NonNullable<ExtensionContext["model"]>, context: Parameters<Registry["complete"]>[1], streamOptions: typeof options & { reasoning: "minimal" }) => { result(): ReturnType<Registry["complete"]> };
 		};
-		const response = registry.streamSimple
-			? await registry.streamSimple(model, context, { ...options, reasoning: "minimal" }).result()
-			: await registry.complete(model, context, { ...options, ...(model.reasoning ? { reasoningEffort: "low" as const } : {}) });
+		const request = registry.streamSimple
+			? registry.streamSimple(model, context, { ...options, reasoning: "minimal" }).result()
+			: registry.complete(model, context, { ...options, ...(model.reasoning ? { reasoningEffort: "low" as const } : {}) });
+		let onAbort: (() => void) | undefined;
+		let response: Awaited<ReturnType<Registry["complete"]>>;
+		try {
+			response = await Promise.race([request, new Promise<never>((_resolve, reject) => {
+				onAbort = () => reject(new Error("Explanation cancelled or timed out"));
+				signal.addEventListener("abort", onAbort, { once: true });
+				if (signal.aborted) onAbort();
+			})]);
+		} finally { if (onAbort) signal.removeEventListener("abort", onAbort); }
 		if (response.stopReason === "aborted" || ctx.signal?.aborted) return unavailable("generation cancelled.");
 		if (response.stopReason === "error") return unavailable("the model request failed.");
 		return threeSentences(messageText(response.content)) ?? unavailable("the model returned no explanation.");
@@ -114,7 +141,7 @@ function webGateResult(answer: GateResult, choices: Choice[]): BrowserGateResult
 async function showGate(ctx: ExtensionContext, choices: Choice[], global?: string, summary?: string): Promise<GateResult> {
 	const remote = webBridge()?.openDecision<unknown>({
 		kind: "command", title: "Review shell command", detail: global,
-		data: { summary, choices: choices.map((choice) => ({ original: choice.part.original, displayWords: choice.part.displayWords, state: choice.state, stateLabel: stateLabel(choice.state), args: choice.args, maxArgs: Math.max(0, choice.part.displayWords.filter((word) => word !== "*").length - 1), pythonScript: !!choice.part.pythonScript })), help: detailedHelp() },
+		data: { summary, choices: choices.map((choice) => ({ original: choice.part.original, displayWords: choice.part.displayWords, state: choice.state, stateLabel: stateLabel(choice.state), args: choice.args, maxArgs: Math.max(0, choice.part.displayWords.filter((word) => word !== "*").length - 1), pythonScript: !!(choice.part.pythonScript || choice.part.unsupported) })), help: detailedHelp() },
 	});
 	const remoteResult = async (): Promise<GateResult> => {
 		const result = await remote!.promise;
@@ -125,17 +152,18 @@ async function showGate(ctx: ExtensionContext, choices: Choice[], global?: strin
 		for (let index = 0; index < choices.length; index++) {
 			const choice = choices[index]!; const submitted = value.choices[index];
 			if (!submitted || !["undecided", "project-allow", "global-allow", "project-deny", "global-deny"].includes(submitted.state)) return { action: "block", reason: `${NAME}: invalid Pi Web command selection` };
-			choice.state = choice.part.pythonScript && ["project-allow", "global-allow"].includes(submitted.state) ? "undecided" : submitted.state;
+			choice.state = (choice.part.pythonScript || choice.part.unsupported) && ["project-allow", "global-allow"].includes(submitted.state) ? "undecided" : submitted.state;
 			const maxArgs = Math.max(0, choice.part.displayWords.filter((word) => word !== "*").length - 1);
 			choice.args = Number.isInteger(submitted.args) ? Math.min(maxArgs, Math.max(0, submitted.args)) : choice.args;
 		}
 		return { action: "allow" };
 	};
-	if (ctx.mode !== "tui") return remote ? remoteResult() : { action: "block", reason: `${NAME}: no interactive UI is available` };
-	return new Promise<GateResult>((resolve) => ctx.ui.custom<GateResult>((tui, theme, _kb, done) => {
+	const cancelled: GateResult = { action: "block", reason: `${NAME}: cancelled by user` };
+	if (ctx.mode !== "tui") return remote ? waitDecision(ctx, remoteResult(), cancelled, () => remote.resolve({ action: "block" })) : { action: "block", reason: `${NAME}: no interactive UI is available` };
+	return customDecision<GateResult>(ctx, cancelled, (tui, theme, _kb, done) => {
 		let selected = 0; let help = false; let settled = false; const prompt = new PromptLine(); const validateIndex = choices.length; const promptIndex = choices.length + 1;
-		const finish = (answer: GateResult) => { if (settled) return; settled = true; remote?.resolve(webGateResult(answer, choices)); done(answer); resolve(answer); };
-		if (remote) remoteResult().then(finish).catch(() => undefined);
+		const finish = (answer: GateResult) => { if (settled) return; settled = true; remote?.resolve(webGateResult(answer, choices)); done(answer); };
+		if (remote) remoteResult().then(finish).catch(() => finish(cancelled));
 		const render = (width: number): string[] => {
 			// Commands are security decisions: wrap them rather than hiding their
 			// trailing arguments behind an ellipsis.
@@ -144,7 +172,7 @@ async function showGate(ctx: ExtensionContext, choices: Choice[], global?: strin
 			const lines = [theme.fg("accent", theme.bold("Review shell command"))];
 			if (global) lines.push(...wrap(theme.fg("dim", `Original: ${global}`)));
 			if (summary) lines.push(...wrap(`Summary: ${summary}`));
-			for (let i = 0; i < choices.length; i++) { const c = choices[i]!; const label = `${markerCell(c.state)} ${ruleFor(c.part, c.args)}${c.part.pythonScript ? " (one time only)" : ""}`; const row = `${i === selected ? "› " : "  "}${label}`; lines.push(...wrap(i === selected ? theme.bg("selectedBg", theme.fg("accent", row)) : row)); }
+			for (let i = 0; i < choices.length; i++) { const c = choices[i]!; const label = `${markerCell(c.state)} ${ruleFor(c.part, c.args)}${c.part.pythonScript || c.part.unsupported ? " (one time only)" : ""}`; const row = `${i === selected ? "› " : "  "}${label}`; lines.push(...wrap(i === selected ? theme.bg("selectedBg", theme.fg("accent", row)) : row)); }
 			const validate = `${selected === validateIndex ? "› " : "  "}Validate current selection`;
 			lines.push(...wrap(theme.bg(selected === validateIndex ? "selectedBg" : "toolPendingBg", validate)));
 			const input = prompt.render(selected === promptIndex);
@@ -160,7 +188,7 @@ async function showGate(ctx: ExtensionContext, choices: Choice[], global?: strin
 			if (matchesKey(data, Key.down)) { selected = Math.min(promptIndex, selected + 1); tui.requestRender(); return; }
 			if (selected < choices.length) {
 				const choice = choices[selected]!;
-				if (choice.part.pythonScript) { if (matchesKey(data, Key.space)) choice.state = nextChoiceState(choice.state, true); }
+				if (choice.part.pythonScript || choice.part.unsupported) { if (matchesKey(data, Key.space)) choice.state = nextChoiceState(choice.state, true); }
 				else if (matchesKey(data, Key.left)) choice.args = Math.max(0, choice.args - 1);
 				else if (matchesKey(data, Key.right)) choice.args = Math.min(choice.part.displayWords.filter((word) => word !== "*").length - 1, choice.args + 1);
 				else if (matchesKey(data, Key.space)) choice.state = nextChoiceState(choice.state, false);
@@ -168,22 +196,23 @@ async function showGate(ctx: ExtensionContext, choices: Choice[], global?: strin
 				tui.requestRender(); return;
 			}
 			if (selected === validateIndex && matchesKey(data, Key.enter)) finish({ action: "allow" });
-		} };
-	}));
+		}, dispose() { if (!settled) remote?.resolve({ action: "block" }); } };
+	}, () => remote?.resolve({ action: "block" }));
 }
 
 async function gateBash(pi: ExtensionAPI, ctx: ExtensionContext, command: string): Promise<{ block: true; reason: string } | undefined> {
 	if (!command.trim()) return { block: true, reason: `${NAME}: empty command` };
-	if (command.trim().startsWith("#")) return undefined;
 	const result = analyseShell(command);
 	const parts = result.parts;
+	if (!result.unsupported && !parts.length) return undefined;
 	const paths = storePaths(ctx.cwd);
 	const stores = await loadStores(ctx.cwd);
+	const before = structuredClone(stores);
 	const choices: Choice[] = parts.map((part) => {
 		const persisted = resolveRule(stores.global, stores.project, part);
 		// A Python script may never be persistently allowed, even through an existing
 		// broad allow rule. Stored deny rules still block it immediately.
-		const state = part.pythonScript && persisted?.state !== "deny" ? "undecided" : choiceState(persisted);
+		const state = (part.pythonScript || part.unsupported) && persisted?.state !== "deny" ? "undecided" : choiceState(persisted);
 		return { part, state, args: Math.max(0, (persisted ? persisted.rule.split(" ").length - 2 : part.displayWords.filter((w) => w !== "*").length - 1)), persisted };
 	});
 	const denied = choices.filter((choice) => savedState(choice.state)?.state === "deny");
@@ -191,6 +220,7 @@ async function gateBash(pi: ExtensionAPI, ctx: ExtensionContext, command: string
 	if (choices.length && choices.every((choice) => savedState(choice.state)?.state === "allow")) return undefined;
 	// This is reached only when at least one part needs a decision: already denied
 	// commands block immediately and fully allowed commands execute without a dialog.
+	if (ctx.mode !== "tui" && !webBridge()?.active) return { block: true, reason: `${NAME}: no interactive UI is available` };
 	const summary = await commandSummary(ctx, command);
 	const answer = await showGate(ctx, choices, command, summary);
 	if (answer.action === "prompt") { if (answer.prompt) pi.sendUserMessage(answer.prompt, { deliverAs: "steer" }); return { block: true, reason: `${NAME}: command cancelled; prompt sent to assistant` }; }
@@ -213,8 +243,11 @@ async function gateBash(pi: ExtensionAPI, ctx: ExtensionContext, command: string
 		changedScopes.add(saved.scope);
 	}
 	for (const store of Object.values(stores)) if (store.whitelist.some((rule) => store.blacklist.includes(rule))) return { block: true, reason: `${NAME}: whitelist/blacklist conflict` };
-	await Promise.all([...changedScopes].map((scope) => saveStore(paths[scope], stores[scope], scope)));
-	const explicitDeny = choices.filter((choice) => savedState(choice.state)?.state === "deny");
+	await Promise.all([...changedScopes].map((scope) => saveChanges(paths[scope], before[scope], stores[scope], scope)));
+	const latest = await loadStores(ctx.cwd);
+	if (parts.some(part => resolveRule(latest.global, latest.project, part)?.state === "deny")) return { block: true, reason: `${NAME}: command denied by the latest saved rules` };
+	if (ctx.signal?.aborted) return { block: true, reason: `${NAME}: cancelled` };
+	const explicitDeny = choices.filter((choice) => savedState(choice.state)?.state === "deny" );
 	if (explicitDeny.length) return { block: true, reason: `${NAME}: command denied\nOriginal: ${command}\nDenied: ${explicitDeny.map((choice) => choice.part.original).join("; ")}` };
 	return undefined;
 }
@@ -230,37 +263,41 @@ async function showEditGate(ctx: ExtensionContext, title: string): Promise<EditC
 		if (value === "enter a prompt for the assistant") return { choice: 4, persistent: false };
 		return { choice: 3, persistent: false };
 	};
-	if (ctx.mode !== "tui") return remote ? fromWeb(await remote.promise) : undefined;
-	return new Promise<EditChoice | undefined>((resolve) => ctx.ui.custom<EditChoice | undefined>((tui, theme, _kb, done) => {
+	if (ctx.mode !== "tui") return remote ? fromWeb(await waitDecision(ctx, remote.promise, "deny", () => remote.resolve("deny"))) : undefined;
+	return customDecision<EditChoice | undefined>(ctx, undefined, (tui, theme, _kb, done) => {
 		let selected = 0; let settled = false; const persistent = [false, false]; const labels = ["1. Allow a directory", "2. Allow this file", "3. Deny", "4. Enter a prompt for the assistant"];
-		const finish = (value: EditChoice | undefined) => { if (settled) return; settled = true; remote?.resolve(value?.choice === 1 ? value.persistent ? "allow directory permanently" : "allow directory once" : value?.choice === 2 ? value.persistent ? "allow file permanently" : "allow file once" : "deny"); done(value); resolve(value); };
-		if (remote) remote.promise.then((value) => finish(fromWeb(value))).catch(() => undefined);
-		return { invalidate() {}, render(width: number) { return [theme.fg("accent", title), ...labels.map((label, index) => { const status = index < 2 ? (persistent[index] ? "✅" : "🔁") : index === 2 ? "❌" : "  "; const row = `${selected === index ? "› " : "  "}${status} ${label}`; return truncateToWidth(selected === index ? theme.bg("selectedBg", row) : row, width); }), theme.fg("dim", "↑↓ select · Space session/persist · Enter confirm · Ctrl+C cancel")]; }, handleInput(data: string) { if (matchesKey(data, Key.ctrl("c"))) return finish(undefined); if (matchesKey(data, Key.up)) selected = Math.max(0, selected - 1); else if (matchesKey(data, Key.down)) selected = Math.min(3, selected + 1); else if (matchesKey(data, Key.space) && selected < 2) persistent[selected] = !persistent[selected]; else if (matchesKey(data, Key.enter)) finish({ choice: (selected + 1) as 1 | 2 | 3 | 4, persistent: selected < 2 && persistent[selected] }); tui.requestRender(); } };
-	}));
+		const finish = (value: EditChoice | undefined) => { if (settled) return; settled = true; remote?.resolve(value?.choice === 1 ? value.persistent ? "allow directory permanently" : "allow directory once" : value?.choice === 2 ? value.persistent ? "allow file permanently" : "allow file once" : "deny"); done(value); };
+		if (remote) remote.promise.then((value) => finish(fromWeb(value))).catch(() => finish(undefined));
+		return { invalidate() {}, render(width: number) { return [theme.fg("accent", title), ...labels.map((label, index) => { const status = index < 2 ? (persistent[index] ? "✅" : "🔁") : index === 2 ? "❌" : "  "; const row = `${selected === index ? "› " : "  "}${status} ${label}`; return truncateToWidth(selected === index ? theme.bg("selectedBg", row) : row, width); }), theme.fg("dim", "↑↓ select · Space session/persist · Enter confirm · Ctrl+C cancel")]; }, handleInput(data: string) { if (matchesKey(data, Key.ctrl("c"))) return finish(undefined); if (matchesKey(data, Key.up)) selected = Math.max(0, selected - 1); else if (matchesKey(data, Key.down)) selected = Math.min(3, selected + 1); else if (matchesKey(data, Key.space) && selected < 2) persistent[selected] = !persistent[selected]; else if (matchesKey(data, Key.enter)) finish({ choice: (selected + 1) as 1 | 2 | 3 | 4, persistent: selected < 2 && persistent[selected] }); tui.requestRender(); }, dispose() { if (!settled) remote?.resolve("deny"); } };
+	}, () => remote?.resolve("deny"));
 }
 
 async function showMirroredEditor(ctx: ExtensionContext, title: string, initial = ""): Promise<string | undefined> {
 	const remote = webBridge()?.openDecision<string | undefined>({ kind: "input", title, initial });
-	if (ctx.mode !== "tui") return remote?.promise;
-	return new Promise<string | undefined>((resolve) => ctx.ui.custom<string | undefined>((tui, theme, _kb, done) => {
+	if (ctx.mode !== "tui") return remote ? waitDecision(ctx, remote.promise, undefined, () => remote.resolve(undefined)) : undefined;
+	return customDecision<string | undefined>(ctx, undefined, (tui, theme, _kb, done) => {
 		const prompt = new PromptLine(); prompt.text = initial; prompt.cursor = initial.length; let settled = false;
-		const finish = (value: string | undefined) => { if (settled) return; settled = true; remote?.resolve(value); done(value); resolve(value); };
-		if (remote) remote.promise.then(finish).catch(() => undefined);
-		return { invalidate() {}, render(width: number) { return [theme.fg("accent", title), truncateToWidth(prompt.render(true), width), theme.fg("dim", "Enter confirm · Ctrl+C cancel")]; }, handleInput(data: string) { if (matchesKey(data, Key.ctrl("c")) || matchesKey(data, Key.escape)) return finish(undefined); if (matchesKey(data, Key.enter)) return finish(prompt.text); if (prompt.handle(data)) tui.requestRender(); } };
-	}));
+		const finish = (value: string | undefined) => { if (settled) return; settled = true; remote?.resolve(value); done(value); };
+		if (remote) remote.promise.then(finish).catch(() => finish(undefined));
+		return { invalidate() {}, render(width: number) { return [theme.fg("accent", title), truncateToWidth(prompt.render(true), width), theme.fg("dim", "Enter confirm · Ctrl+C cancel")]; }, handleInput(data: string) { if (matchesKey(data, Key.ctrl("c")) || matchesKey(data, Key.escape)) return finish(undefined); if (matchesKey(data, Key.enter)) return finish(prompt.text); if (prompt.handle(data)) tui.requestRender(); }, dispose() { if (!settled) remote?.resolve(undefined); } };
+	}, () => remote?.resolve(undefined));
 }
 
 async function gateEdit(pi: ExtensionAPI, ctx: ExtensionContext, toolName: string, input: unknown): Promise<{ block: true; reason: string } | undefined> {
-	const path = pathFor(ctx.cwd, input && typeof input === "object" ? (input as { path?: unknown }).path : undefined);
+	const requestedPath = pathFor(ctx.cwd, input && typeof input === "object" ? (input as { path?: unknown }).path : undefined);
+	if (!requestedPath) return { block: true, reason: `${NAME}: ${toolName} requires a path` };
+	const path = await canonicalPath(requestedPath);
 	if (!path) return { block: true, reason: `${NAME}: ${toolName} requires a path` };
 	const store = await loadStore(projectStorePath(ctx.cwd));
+	const before = structuredClone(store);
 	if (store.editFiles.includes(path) || sessionEditFiles.has(path) || store.editDirectories.some((d) => within(d, path)) || [...sessionEditDirectories].some((d) => within(d, path))) return undefined;
-	if (!ctx.hasUI) return within(resolve(ctx.cwd), path) ? undefined : { block: true, reason: `${NAME}: ${toolName} blocked without UI outside current directory` };
+	if (ctx.mode !== "tui" && !webBridge()?.active) return { block: true, reason: `${NAME}: ${toolName} requires explicit permission without an interactive UI` };
 	const selected = await showEditGate(ctx, `${toolName}: ${path}`);
 	if (!selected || selected.choice === 3) return { block: true, reason: `${NAME}: ${toolName} denied` };
 	if (selected.choice === 4) { const prompt = await showMirroredEditor(ctx, "Enter a prompt for the assistant"); if (prompt?.trim()) pi.sendUserMessage(prompt.trim(), { deliverAs: "steer" }); return { block: true, reason: `${NAME}: ${toolName} cancelled` }; }
-	if (selected.choice === 1) { const chosen = await showMirroredEditor(ctx, "Allowed directory", resolve(ctx.cwd)); if (!chosen?.trim()) return { block: true, reason: `${NAME}: directory permission cancelled` }; const dir = resolve(chosen.trim()); if (selected.persistent) { store.editDirectories.push(dir); await saveStore(projectStorePath(ctx.cwd), store, "project"); } else sessionEditDirectories.add(dir); return undefined; }
-	if (selected.persistent) { store.editFiles.push(path); await saveStore(projectStorePath(ctx.cwd), store, "project"); } else sessionEditFiles.add(path); return undefined;
+	if (path !== await canonicalPath(requestedPath)) return { block: true, reason: `${NAME}: file target changed while awaiting permission` };
+	if (selected.choice === 1) { const chosen = await showMirroredEditor(ctx, "Allowed directory", resolve(ctx.cwd)); if (!chosen?.trim()) return { block: true, reason: `${NAME}: directory permission cancelled` }; const dir = await canonicalPath(resolve(ctx.cwd, chosen.trim())); if (!within(dir, path) || !within(dir, await canonicalPath(requestedPath))) return { block: true, reason: `${NAME}: selected directory does not contain the requested file` }; if (selected.persistent) { store.editDirectories.push(dir); await saveChanges(projectStorePath(ctx.cwd), before, store, "project"); } else sessionEditDirectories.add(dir); return undefined; }
+	if (selected.persistent) { store.editFiles.push(path); await saveChanges(projectStorePath(ctx.cwd), before, store, "project"); } else sessionEditFiles.add(path); return undefined;
 }
 
 function helpText(): string { return "Usage: /whitelist [global|project] [list|allow|add|deny|block|remove|rm|del|delete|help|--help|-h]"; }
@@ -346,9 +383,12 @@ async function list(ctx: ExtensionCommandContext, stores: Stores, scope?: RuleSc
 	ctx.ui.notify(rules.length ? rules.join("\n") : `No ${scope ? `${scope} ` : ""}whitelist or blacklist rules configured.\nUse /whitelist help for help.`, "info");
 }
 export default function (pi: ExtensionAPI) {
+	const reset = () => { cancelDecisions(); sessionEditDirectories.clear(); sessionEditFiles.clear(); };
+	pi.on("session_shutdown", reset);
 	// Validate/migrate both configurations as soon as a session starts, not only when
 	// the first protected tool is called. File-edit permissions remain project-only.
 	pi.on("session_start", async (_event, ctx) => {
+		reset();
 		await loadStores(ctx.cwd);
 	});
 	pi.registerCommand("whitelist", { description: "List and edit global or project command allow/deny rules", handler: async (args, ctx) => {
@@ -357,7 +397,7 @@ export default function (pi: ExtensionAPI) {
 		if (words[0] === "global") { scope = "global"; scoped = true; words.shift(); }
 		else if (words[0] === "project" || words[0] === "local") { scoped = true; words.shift(); }
 		const [verb, ...rest] = words;
-		const paths = storePaths(ctx.cwd); const stores = await loadStores(ctx.cwd);
+		const paths = storePaths(ctx.cwd); const stores = await loadStores(ctx.cwd); const before = structuredClone(stores);
 		if (!verb) {
 			if (scoped || ctx.mode !== "tui") { await list(ctx, stores, scoped ? scope : undefined); return; }
 			const draft = managerEntriesFor(stores);
@@ -367,7 +407,7 @@ export default function (pi: ExtensionAPI) {
 				if (action.action === "quit") {
 					const next = storesForManagerEntries(stores, draft);
 					const changedScopes = (Object.keys(next) as RuleScope[]).filter((changedScope) => changedCommandRules(stores[changedScope], next[changedScope]));
-					await Promise.all(changedScopes.map((changedScope) => saveStore(paths[changedScope], next[changedScope], changedScope)));
+					await Promise.all(changedScopes.map((changedScope) => saveChanges(paths[changedScope], stores[changedScope], next[changedScope], changedScope)));
 					return;
 				}
 				if (action.action === "delete") {
@@ -401,11 +441,11 @@ export default function (pi: ExtensionAPI) {
 			const hasAllow = store.whitelist.includes(rule), hasDeny = store.blacklist.includes(rule);
 			if (!hasAllow && !hasDeny) { ctx.ui.notify(`Rule does not exist in ${scopeLabel(scope)} rules.`, "error"); return; }
 			if (hasDeny && !(await ctx.ui.confirm("Delete blacklist rule?", `Delete ${marker(`${scope}-deny` as ChoiceState)} ${rule} from ${scopeLabel(scope)} rules?`))) return;
-			store.whitelist = store.whitelist.filter((value) => value !== rule); store.blacklist = store.blacklist.filter((value) => value !== rule); await saveStore(paths[scope], store, scope); return;
+			store.whitelist = store.whitelist.filter((value) => value !== rule); store.blacklist = store.blacklist.filter((value) => value !== rule); await saveChanges(paths[scope], before[scope], store, scope); return;
 		}
 		const own = isAllow ? store.whitelist : store.blacklist; const other = isAllow ? store.blacklist : store.whitelist;
 		if (other.includes(rule)) { ctx.ui.notify("Rule conflicts with the other list in this scope.", "error"); return; }
-		if (!own.includes(rule)) own.push(rule); await saveStore(paths[scope], store, scope);
+		if (!own.includes(rule)) own.push(rule); await saveChanges(paths[scope], before[scope], store, scope);
 	} });
 	pi.on("tool_call", async (event, ctx) => { if (event.toolName === "bash") { const command = event.input && typeof event.input === "object" ? (event.input as { command?: unknown }).command : undefined; return typeof command === "string" ? gateBash(pi, ctx, command) : { block: true, reason: `${NAME}: invalid bash command` }; } if (event.toolName === "edit" || event.toolName === "write") return gateEdit(pi, ctx, event.toolName, event.input); return undefined; });
 }

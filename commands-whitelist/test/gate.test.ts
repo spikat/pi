@@ -54,7 +54,7 @@ async function review(t: TestContext, options: {
 		const symbol = Symbol.for("spikat.pi.web.bridge");
 		const globals = globalThis as Record<symbol, unknown>;
 		const previous = globals[symbol];
-		globals[symbol] = { openDecision(dialog: { data?: Record<string, unknown> }) {
+		globals[symbol] = { active: true, openDecision(dialog: { data?: Record<string, unknown> }) {
 			dialogs.push(dialog);
 			return { promise: Promise.resolve({ action: "block" }), resolve() {} };
 		} };
@@ -152,10 +152,10 @@ test("no active model produces a visible status without a request", async (t) =>
 	assert.match(renders[0]!.join("\n"), /Explanation unavailable: no active model/);
 });
 
-test("an already aborted turn does not request an explanation", async (t) => {
-	const { requests, renders } = await review(t, { signal: AbortSignal.abort() });
-	assert.equal(requests.length, 0);
-	assert.match(renders[0]!.join("\n"), /Explanation unavailable: generation cancelled/);
+test("an already aborted turn denies without opening a dialog or requesting an explanation", async (t) => {
+	const { requests, renders, result } = await review(t, { signal: AbortSignal.abort() });
+	assert.equal(requests.length, 0); assert.equal(renders.length, 0);
+	assert.deepEqual(result, { block: true, reason: "commands whitelist: cancelled by user" });
 });
 
 test("the web dialog receives the same explanation", async (t) => {

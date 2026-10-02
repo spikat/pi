@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { analyseShell, classification, EMPTY_STORE, loadStore, matchesRule, normalizeRule, resolveRule, ruleFor, saveStore } from "../core.js";
@@ -259,6 +259,7 @@ test("version migration, malformed config and atomic persistence", async () => {
   await writeFile(file, JSON.stringify({ version: 1, actionKeys: [] }));
   assert.deepEqual(await loadStore(file), EMPTY_STORE);
   await writeFile(file, "{"); await assert.rejects(() => loadStore(file), /invalid JSON/);
+  await rm(file);
   await saveStore(file, { ...EMPTY_STORE, whitelist: ["ls *", "ls *"] });
   assert.deepEqual(JSON.parse(await readFile(file, "utf8")).whitelist, ["ls *"]);
   await assert.rejects(() => saveStore(file, { ...EMPTY_STORE, whitelist: ["ls *"], blacklist: ["ls *"] }), /identical/);

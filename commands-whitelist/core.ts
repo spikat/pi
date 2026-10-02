@@ -1,4 +1,5 @@
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
@@ -31,7 +32,7 @@ export function shellWords(source: string): { words: string[]; dynamic: boolean 
 		if (c === "\\" && quote !== "'") { escaped = true; continue; }
 		if ((c === "'" || c === '"') && !quote) { quote = c; continue; }
 		if (c === quote) { quote = undefined; continue; }
-		if (!quote && c === "(" && (source[i - 1] === "$" || source[i - 1] === "<")) { substitutionDepth++; current += c; continue; }
+		if (!quote && c === "(" && (source[i - 1] === "$" || source[i - 1] === "<" || source[i - 1] === ">")) { substitutionDepth++; current += c; continue; }
 		if (!quote && c === ")" && substitutionDepth > 0) { substitutionDepth--; current += c; continue; }
 		if (!quote && substitutionDepth === 0 && /\s/.test(c)) { if (current) { words.push(current); current = ""; } continue; }
 		if (c === "$" && source[i + 1] !== "(" && source[i + 1] !== "{") dynamic = true;
@@ -58,7 +59,7 @@ function stripRedirections(source: string): string {
 			while (i + 1 < source.length && !/\s|[|;&(){}]/.test(source[i + 1]!)) i++;
 			continue;
 		}
-		if (!quote && (c === ">" || (c === "<" && source[i + 1] !== "("))) {
+		if (!quote && (c === ">" || c === "<") && source[i + 1] !== "(") {
 			while (i + 1 < source.length && /[>&]/.test(source[i + 1]!)) i++;
 			while (i + 1 < source.length && /\s/.test(source[i + 1]!)) i++;
 			while (i + 1 < source.length && !/\s|[|;&(){}]/.test(source[i + 1]!)) i++;
@@ -85,6 +86,8 @@ function hereDocumentDelimiter(line: string): { delimiter: string; stripTabs: bo
 		while (/\s/.test(line[cursor] ?? "")) cursor++;
 		if (!line[cursor]) return undefined;
 		const quoted = line[cursor] === "'" || line[cursor] === '"' ? line[cursor++] : undefined;
+		// Expansible or multiple heredocs require approval of the entire command.
+		if (!quoted || line.slice(cursor).includes("<<")) return { delimiter: "", stripTabs };
 		let delimiter = "";
 		while (cursor < line.length && (quoted ? line[cursor] !== quoted : !/\s|[|;&(){}]/.test(line[cursor]!))) delimiter += line[cursor++]!;
 		return delimiter ? { delimiter, stripTabs } : undefined;
@@ -101,6 +104,7 @@ function removeHereDocumentBodies(command: string): string | undefined {
 		output.push(line);
 		const hereDoc = hereDocumentDelimiter(line);
 		if (!hereDoc) continue;
+		if (!hereDoc.delimiter) return undefined;
 		let found = false;
 		while (++index < lines.length) {
 			const rawCandidate = lines[index]!.replace(/\r$/, "");
@@ -156,7 +160,7 @@ export function splitShellLists(command: string): string[] | undefined {
 function nestedExpressions(source: string): string[] | undefined {
 	const nested: string[] = [];
 	for (let i = 0; i < source.length; i++) {
-		if (source[i] !== "$" && !(source[i] === "<" && source[i + 1] === "(")) continue;
+		if (source[i] !== "$" && !((source[i] === "<" || source[i] === ">") && source[i + 1] === "(")) continue;
 		const start = source[i] === "$" ? i + 1 : i + 1;
 		if (source[start] !== "(") continue;
 		// `$((...))` is arithmetic expansion, not a command substitution. Its
@@ -227,7 +231,7 @@ function unsupportedShell(command: string): { parts: CommandPart[]; unsupported:
 }
 
 export function analyseShell(command: string): { parts: CommandPart[]; unsupported: boolean } {
-	if (/\b(function\s+[A-Za-z_]|[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\)\s*\{)/.test(command)) return unsupportedShell(command);
+	if (command.includes("`") || /\b(function\s+[A-Za-z_]|[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\)\s*\{)/.test(command)) return unsupportedShell(command);
 	const lists = splitShellLists(command);
 	if (!lists) return unsupportedShell(command);
 	const parts: CommandPart[] = [];
@@ -240,7 +244,7 @@ export function analyseShell(command: string): { parts: CommandPart[]; unsupport
 			parts.push(...result.parts);
 			continue;
 		}
-		const clean = stripRedirections(original).trim();
+		const clean = stripRedirections(original).trim().replace(/^\s*(?:if|while|until|elif)\s+/, "");
 		let parsed = shellWords(clean);
 		if (!parsed || !parsed.words.length) return unsupportedShell(command);
 		// `do`, `then`, and `else` introduce a real command after a control-list
@@ -248,6 +252,7 @@ export function analyseShell(command: string): { parts: CommandPart[]; unsupport
 		if (["do", "then", "else"].includes(parsed.words[0]!) && parsed.words.length > 1) parsed = shellWords(clean.replace(/^\s*(?:do|then|else)\s+/, ""));
 		if (!parsed || !parsed.words.length) return unsupportedShell(command);
 		const first = parsed.words[0]!;
+		if (["if", "while", "until", "elif", "case", "select", "!", "time"].includes(first)) return unsupportedShell(command);
 		const pythonScript = isPythonScript(parsed.words);
 		if (!CONTROL_WORDS.has(first) && first !== "for" && first !== "while" && first !== "if" && first !== "case") {
 			const displayWords = ruleWords(parsed.words, parsed.dynamic);
@@ -291,6 +296,7 @@ export function normalizeRule(text: string): string | undefined {
 }
 
 export function matchesRule(rule: string, part: CommandPart): boolean {
+	if (part.unsupported) return rule === `${part.original} *` || rule === "*";
 	const ruleWords = normalizeRule(rule)?.split(" ");
 	if (!ruleWords) return false;
 	const actual = part.displayWords.filter((word) => word !== "*");
@@ -340,19 +346,55 @@ export async function loadStore(path: string, scope: RuleScope = "project"): Pro
 	const raw = await readFile(path, "utf8");
 	let value: unknown;
 	try { value = JSON.parse(raw); } catch { throw new Error(`commands whitelist: invalid JSON in ${path}`); }
-	if (value && typeof value === "object" && !("version" in value)) { await rm(path); return { ...EMPTY_STORE, whitelist: [], blacklist: [], editDirectories: [], editFiles: [] }; }
+	if (value && typeof value === "object" && !("version" in value)) { await rename(path, `${path}.${randomUUID()}.bak`); return { ...EMPTY_STORE, whitelist: [], blacklist: [], editDirectories: [], editFiles: [] }; }
 	const version = value && typeof value === "object" ? (value as { version?: unknown }).version : undefined;
-	if (typeof version === "number" && version < CONFIG_VERSION) { await rm(path); return { ...EMPTY_STORE, whitelist: [], blacklist: [], editDirectories: [], editFiles: [] }; }
+	if (typeof version === "number" && version < CONFIG_VERSION) { await rename(path, `${path}.${randomUUID()}.bak`); return { ...EMPTY_STORE, whitelist: [], blacklist: [], editDirectories: [], editFiles: [] }; }
 	if (!isStore(value, scope)) throw new Error(`commands whitelist: unsupported or malformed configuration in ${path}`);
 	return { ...value, whitelist: [...new Set(value.whitelist)], blacklist: [...new Set(value.blacklist)], editDirectories: scope === "global" ? [] : [...new Set(value.editDirectories)], editFiles: scope === "global" ? [] : [...new Set(value.editFiles)] };
 }
 
-export async function saveStore(path: string, store: Store, scope: RuleScope = "project"): Promise<void> {
+async function writeStore(path: string, store: Store, scope: RuleScope): Promise<void> {
 	const normalized: Store = { version: 2, whitelist: [...new Set(store.whitelist)], blacklist: [...new Set(store.blacklist)], editDirectories: [...new Set(store.editDirectories)], editFiles: [...new Set(store.editFiles)] };
 	if (normalized.whitelist.some((r) => normalized.blacklist.includes(r))) throw new Error("commands whitelist: identical whitelist and blacklist rule");
 	await mkdir(dirname(path), { recursive: true });
-	const temp = `${path}.${process.pid}.${Date.now()}.tmp`;
+	const temp = `${path}.${randomUUID()}.tmp`;
 	const serializable = scope === "global" ? { version: normalized.version, whitelist: normalized.whitelist, blacklist: normalized.blacklist } : normalized;
-	await writeFile(temp, `${JSON.stringify(serializable, null, 2)}\n`, "utf8");
-	await rename(temp, path);
+	try {
+		await writeFile(temp, `${JSON.stringify(serializable, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+		await rename(temp, path);
+	} finally { await rm(temp, { force: true }); }
+}
+
+/** Lock the entire read-modify-write operation, across processes. Never hold it during UI. */
+export async function updateStore(path: string, mutate: (store: Store) => Store | void, scope: RuleScope = "project"): Promise<void> {
+	await mkdir(dirname(path), { recursive: true });
+	const lock = `${path}.lock`;
+	const deadline = Date.now() + 5_000;
+	while (true) {
+		try { await mkdir(lock); break; }
+		catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			if (Date.now() >= deadline) throw new Error(`commands whitelist: configuration is locked: ${lock}. If a writer crashed, remove the stale lock before retrying.`);
+			await new Promise(resolve => setTimeout(resolve, 20));
+		}
+	}
+	try { const store = await loadStore(path, scope); await writeStore(path, mutate(store) ?? store, scope); }
+	finally { await rm(lock, { recursive: true, force: true }); }
+}
+
+export async function saveStore(path: string, store: Store, scope: RuleScope = "project"): Promise<void> {
+	await updateStore(path, () => store, scope);
+}
+
+/** Merge only this decision's delta into the latest store, preserving unrelated decisions. */
+export async function saveChanges(path: string, before: Store, after: Store, scope: RuleScope = "project"): Promise<void> {
+	await updateStore(path, current => {
+		for (const key of ["whitelist", "blacklist", "editDirectories", "editFiles"] as const) {
+			const removed = before[key].filter(value => !after[key].includes(value));
+			const added = after[key].filter(value => !before[key].includes(value));
+			current[key] = [...new Set([...current[key].filter(value => !removed.includes(value)), ...added])];
+		}
+		// A concurrent deny cannot be silently overwritten by a stale allow decision.
+		current.whitelist = current.whitelist.filter(rule => !current.blacklist.includes(rule));
+	}, scope);
 }

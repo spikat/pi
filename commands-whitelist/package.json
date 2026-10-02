@@ -1,6 +1,6 @@
 {
   "name": "@spikat/pi-commands-whitelist",
-  "version": "1.1.8",
+  "version": "1.1.9",
   "description": "Review shell commands and file edits before Pi executes them",
   "license": "MIT",
   "type": "module",
@@ -19,6 +19,7 @@
   "files": [
     "index.ts",
     "core.ts",
+    "decisions.ts",
     "README.md",
     "LICENSE"
   ],

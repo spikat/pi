@@ -43,7 +43,9 @@ is reviewed as:
 
 Rules from both scopes are evaluated for every command. A matching blacklist rule always wins over an allow rule, whether it is global or project-local. Thus, a project may deny a command that a global rule allows, and a global denial also blocks a project-local allow. If all parts are already allowed, execution proceeds without a dialog. If any part is already denied, execution is blocked and Pi receives the original command, blocked parts, and matching rules. Only when a review dialog is needed, the active model generates a plain-text summary (one to three sentences) explaining the command and its usefulness for the current task; it is displayed after the complete command and before the per-command choices. The request uses minimal reasoning and reserves output tokens for both reasoning and the explanation; older Pi versions use the legacy completion API with low reasoning. If generation fails, is cancelled, or returns no text, an explicit **Explanation unavailable** status appears in the terminal and web dialog instead of silently omitting the summary. Summary generation never changes the approval choices. Unresolved `🔁` choices are allowed only for the current request and are not saved.
 
-When a shell construct cannot be safely parsed (for example a shell function), the original complete command is shown as a single review entry.
+When a shell construct cannot be safely parsed (for example a shell function, backticks or an expansible heredoc), the original complete command requires a fresh one-time approval. Persistent allow rules cannot bypass this fallback. Per-command rules cannot reliably classify hidden commands in unsupported syntax; approval of the complete request is an explicit user decision, not proof that every nested command is allowed. Quoted heredoc bodies are data; non-quoted heredocs require full-command approval. Conditions in `if`, `while`, `until` and `elif`, and both input/output process substitutions, are inspected.
+
+This is not a sandbox or a complete shell AST. Prefix rules authorize programs and their remaining arguments, including redirections; opaque interpreters, scripts and programs such as `xargs` may perform arbitrary actions. Review the entire displayed command. The explanatory model request has a ten-second deadline and never grants permission.
 
 ### Python scripts
 
@@ -78,7 +80,7 @@ Without a scope prefix, mutations target the current **project**. `list` without
 
 ## File edit/write protection
 
-The extension also keeps a gate for Pi `edit` and `write` calls. It supports an allow rule for a directory and all descendants, an exact-file allow rule, denial, and sending a prompt to the assistant. Session approvals remain only in memory; persistent approvals are stored in the **project** configuration. Global command rules never grant file edit/write permissions.
+The extension also keeps a gate for Pi `edit` and `write` calls. It supports an allow rule for a directory and all descendants, an exact-file allow rule, denial, and sending a prompt to the assistant. Session approvals remain only in memory and are cleared on session start/shutdown; persistent approvals are stored in the **project** configuration. Without a terminal or active web bridge, unapproved edits/writes are blocked, including files inside the current directory. Directory approvals must contain the requested canonical target; relative selections are anchored to the session cwd. Existing parents are resolved for new files. Symlink escapes do not inherit a lexical directory approval, but filesystem races remain possible: this is not a sandbox. Global command rules never grant file edit/write permissions.
 
 ## Pi Web integration
 
@@ -126,7 +128,7 @@ when that variable is set. It contains command rules only:
 }
 ```
 
-Both files are written atomically and created only on the first persistent save in their scope. Existing project configuration files remain compatible. In a global file, legacy `editDirectories` and `editFiles` fields are ignored and removed on its next save. Configurations with a version lower than 2 are deleted at startup. Invalid JSON, malformed version-2 content, or future versions cause a startup error.
+Both files are written atomically and created only on the first persistent save in their scope. Read-modify-write operations use per-file interprocess locks; decision deltas preserve unrelated concurrent changes and concurrent deny rules take precedence. If a process crashes while holding `<config>.lock`, subsequent writes fail with a diagnostic rather than silently overwriting data; remove that stale directory only after verifying no writer is active. Existing project configuration files remain compatible. In a global file, legacy `editDirectories` and `editFiles` fields are ignored and removed on its next save. Configurations with a version lower than 2 are moved to a uniquely named `.bak` file at startup and reset. Invalid JSON, malformed version-2 content, or future versions cause a startup error.
 
 ## Development
 
