@@ -2,26 +2,24 @@ import { execFile } from "node:child_process";
 import { getMarkdownTheme, isToolCallEventType, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, SelectList, Spacer, Text } from "@earendil-works/pi-tui";
 import { ReviewUI } from "./web-ui.js";
+import { isSnapshotInspection } from "./inspection.js";
+import { isTestPath, parseFindings } from "./findings.js";
 import { parseInlineFinding, postInlineFinding, validateInlineFindings } from "./inline.js";
 import { ALL_COMMENTS, CHECK_COMMENTS, JUST_ME, checkPrompt, chooseCommentActions, currentGitLogin, loadCommentThreads, parseAssessment, publishCommentAction, type Assessment, type CommentThread } from "./comments.js";
 
 const MAX_SECTION_CHARS = 50000;
 const MAX_FILE_DIFF_CHARS = 12000;
 const MAX_LISTED_PATHS = 20;
-const WEB_BRIDGE_SYMBOL = Symbol.for("spikat.pi.web.bridge");
-const WEB_COMMAND_CONTRIBUTORS_SYMBOL = Symbol.for("spikat.pi.web.command-contributors");
+import { registerWebCommand } from "./web-command.js";
 const RUN_RELEVANT_TESTS = "Run all tests relevant to the changes (working branch)";
 const SKIP_TESTS = "Skip test execution (branch already validated in CI)";
 const FIX_LOCALLY = "Fix locally";
 const COMMENT_ON_PR = "Comment on the PR";
 const TEST_RUNNER_COMMAND_PATTERN = /(?:^|(?:&&|\|\||;|\n)\s*)(?:(?:go|cargo|deno|dotnet|flutter|mix|bazel|buck|meson)\s+test\b|ctest\b|(?:npm|pnpm|yarn|bun)\s+(?:(?:run|exec)\s+)?test\b|(?:npx|bunx)\s+(?:--no-install\s+)?(?:jest|vitest|mocha|ava)\b|node\s+--test\b|(?:python(?:3)?\s+-m\s+)?(?:pytest|unittest)\b|(?:uv\s+run|poetry\s+run)\s+pytest\b|(?:make|g?make)\s+test\b|(?:\.?\/?)(?:mvnw|gradlew)\s+test\b|(?:mvn|gradle)\s+test\b|(?:bundle\s+exec\s+)?rspec\b|phpunit\b|php\s+artisan\s+test\b)/im;
-type WebBridge = { registerCommand(name: string, handler: (args: string) => Promise<void> | void): () => void };
-type WebContributor = (bridge: WebBridge) => void;
-function registerWebCommand(name: string, handler: (args: string) => Promise<void> | void): void { const global = globalThis as Record<symbol, unknown>; let contributors = global[WEB_COMMAND_CONTRIBUTORS_SYMBOL] as Set<WebContributor> | undefined; if (!contributors) { contributors = new Set(); global[WEB_COMMAND_CONTRIBUTORS_SYMBOL] = contributors; } const contributor: WebContributor = (bridge) => { bridge.registerCommand(name, handler); }; contributors.add(contributor); (global[WEB_BRIDGE_SYMBOL] as WebBridge | undefined)?.registerCommand(name, handler); }
 
 function runCommand(command: string, args: string[], cwd: string, input?: string): Promise<string> {
 	return new Promise((resolve, reject) => {
-		const child = execFile(command, args, { cwd, maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {
+		const child = execFile(command, args, { cwd, maxBuffer: 10 * 1024 * 1024, timeout: 30_000 }, (error, stdout, stderr) => {
 			if (error) {
 				reject(new Error((stderr || error.message).trim()));
 				return;
@@ -35,7 +33,8 @@ function runCommand(command: string, args: string[], cwd: string, input?: string
 }
 
 function runGit(args: string[], cwd: string): Promise<string> {
-	return runCommand("git", args, cwd);
+	const safeArgs = ["diff", "show", "log"].includes(args[0] ?? "") ? [args[0]!, "--no-ext-diff", "--no-textconv", ...args.slice(1)] : args;
+	return runCommand("git", safeArgs, cwd);
 }
 
 async function tryGit(args: string[], cwd: string): Promise<string | undefined> {
@@ -80,7 +79,7 @@ const BUILD_CONSTRAINT_PATTERN = /^[+-]\/\/(?:go:build|\s+\+build)\b/m;
 function patchPriority(patch: string, path: string): number {
 	const lowerPath = path.toLowerCase();
 	if (lowerPath.includes("pkg/security/")) return 0;
-	if (/(?:_test\.go|\/(?:test|tests)\/)/.test(lowerPath)) return 1;
+	if (isTestPath(lowerPath)) return 1;
 	if (BUILD_CONSTRAINT_PATTERN.test(patch) || /(?:^|\/)(?:go\.mod|go\.sum|go\.work|go\.work\.sum)$/.test(lowerPath) || /(?:^|\/)(?:rules|config)(?:\/|\.|$)/.test(lowerPath)) return 2;
 	return 3;
 }
@@ -113,7 +112,7 @@ function renderDiffByFile(diff: string, emptyMessage: string): RenderedDiff {
 	}
 
 	if (omitted.length > 0) {
-		included.push(`[Omitted patches for ${omitted.length} subsequent file(s) after ${MAX_SECTION_CHARS} characters: ${formatPaths(omitted)}. See the exhaustive file list above.]`);
+		included.push(`[Omitted patches for ${omitted.length} subsequent file(s) after ${MAX_SECTION_CHARS} characters: ${formatPaths(omitted)}. See the supplied file list (which may also be truncated).]`);
 	}
 
 	return { text: included.join("\n"), truncated };
@@ -122,6 +121,15 @@ function renderDiffByFile(diff: string, emptyMessage: string): RenderedDiff {
 function parseChangedFiles(nameStatus: string): ChangedFile[] {
 	if (!nameStatus) return [];
 
+	if (nameStatus.includes("\0")) {
+		const fields = nameStatus.split("\0"); const files: ChangedFile[] = [];
+		for (let i = 0; i < fields.length;) {
+			const status = fields[i++]!; if (!status) break;
+			const source = fields[i++]; const path = /^[RC]/.test(status) ? fields[i++] : source;
+			if (path) files.push({ status, path });
+		}
+		return files;
+	}
 	return nameStatus.split("\n").flatMap((line) => {
 		const fields = line.split("\t");
 		if (fields.length < 2) return [];
@@ -133,7 +141,10 @@ function parseChangedFiles(nameStatus: string): ChangedFile[] {
 
 function formatPaths(paths: string[]): string {
 	if (paths.length === 0) return "none";
-	const shown = paths.slice(0, MAX_LISTED_PATHS);
+	const shown = paths.slice(0, MAX_LISTED_PATHS).map(path => {
+		const printable = /[\t\r\n"\\]/.test(path) ? JSON.stringify(path) : path;
+		return printable.length > 500 ? `${printable.slice(0, 500)}…` : printable;
+	});
 	return `${shown.join(", ")}${paths.length > shown.length ? `, … (+${paths.length - shown.length})` : ""}`;
 }
 
@@ -169,7 +180,7 @@ function summarizeChangeSurface(nameStatus: string, diff: string, emptyMessage: 
 	if (files.length === 0) return emptyMessage;
 
 	const pathsWithStatus = (prefix: string) => files.filter(({ status }) => status.startsWith(prefix)).map(({ path }) => path);
-	const isTestFile = ({ path }: ChangedFile) => /(?:_test\.go|\/(?:test|tests)\/)/.test(path);
+	const isTestFile = ({ path }: ChangedFile) => isTestPath(path);
 	const added = pathsWithStatus("A");
 	const deleted = pathsWithStatus("D");
 	const renamed = pathsWithStatus("R");
@@ -253,9 +264,9 @@ const DATADOG_AGENT_SECURITY_REVIEW = [
 	"  - Explicitly call out meaningful missing coverage: kernel feature variants, architecture coverage, reload paths, overload behavior, and regression tests for false-positive/false-negative scenarios.",
 ].join("\n");
 
-async function resolveBaseRef(cwd: string): Promise<string | undefined> {
+async function resolveBaseRef(cwd: string, explicit?: string): Promise<string | undefined> {
 	const originHead = await tryGit(["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], cwd);
-	const candidates = [originHead, "origin/main", "origin/master", "main", "master"].filter((value): value is string => !!value);
+	const candidates = (explicit ? [explicit] : [originHead, "origin/main", "origin/master", "main", "master"]).filter((value): value is string => !!value);
 
 	for (const candidate of candidates) {
 		const mergeBase = await tryGit(["merge-base", "HEAD", candidate], cwd);
@@ -365,16 +376,6 @@ async function preparePullRequest(pr: PullRequest, cwd: string, remoteUrls: stri
 	return { ...pr, head, base, cwd };
 }
 
-function parseFindings(reviewText: string): string[] {
-	const severity = "Critical|High|Medium|Low|Nit";
-	const headingPattern = new RegExp(`^###\\s+\\[(${severity})\\][^\\n]*(?:\\n(?!###\\s+\\[(?:${severity})\\]).*)*`, "gim");
-	const headingMatches = reviewText.match(headingPattern)?.map((finding) => finding.trim()).filter(Boolean) ?? [];
-	if (headingMatches.length > 0) return headingMatches;
-
-	const bulletPattern = new RegExp(`^(?:[-*]|\\d+\\.)\\s+(?:\\*\\*)?(?:${severity})(?:\\*\\*)?[:\\s-].*(?:\\n(?![-*]\\s+(?:(?:\\*\\*)?(?:${severity})(?:\\*\\*)?[:\\s-])|\\d+\\.\\s+(?:(?:\\*\\*)?(?:${severity})(?:\\*\\*)?[:\\s-])).*)*`, "gim");
-	return reviewText.match(bulletPattern)?.map((finding) => finding.trim()).filter(Boolean) ?? [];
-}
-
 function chooseFindingAction(ctx: ExtensionContext, ui: ReviewUI, finding: string, index: number, total: number, action: ReviewAction = "fix"): Promise<string | null | undefined> {
 	const question = action === "comment" ? "Post an inline thread on the PR for this issue?" : "Generate a fix for this issue?";
 	const prompt = `Finding ${index + 1}/${total}\n\n${finding}\n\n${question}`;
@@ -422,7 +423,7 @@ function chooseFindingAction(ctx: ExtensionContext, ui: ReviewUI, finding: strin
 				choices.handleInput(data);
 				tui.requestRender();
 			},
-			handleMouse: (event) => choices.handleMouse(event),
+			handleMouse: (event: unknown) => (choices as unknown as { handleMouse?: (event: unknown) => { handled?: boolean; capture?: boolean; focus?: boolean; render?: boolean } | undefined }).handleMouse?.(event),
 			dispose: () => signal.removeEventListener("abort", cancel),
 		};
 	});
@@ -447,9 +448,9 @@ export default function (pi: ExtensionAPI) {
 	let reviewUI = new ReviewUI();
 	pi.on("session_start", async (_event, ctx) => {
 		reviewUI.dispose(); reviewUI = new ReviewUI();
-		current = ctx; state = { mode: "idle" }; preparing = false;
+		current = ctx; state = { mode: "idle" }; preparing = false; web.activate();
 	});
-	pi.on("session_shutdown", () => { reviewUI.dispose(); current = undefined; state = { mode: "idle" }; });
+	pi.on("session_shutdown", () => { reviewUI.dispose(); current = undefined; state = { mode: "idle" }; web.dispose(); });
 
 	async function processPullRequestFindings(ctx: ExtensionContext, findings: string[], pr: PreparedPullRequest): Promise<void> {
 		const ui = reviewUI;
@@ -518,6 +519,11 @@ export default function (pi: ExtensionAPI) {
 			const choice = await chooseFindingAction(ctx, ui, finding, index, findings.length);
 			if (ui.isDisposed) return;
 
+			if (!choice) {
+				state = { mode: "idle" };
+				ctx.ui.notify("Review cancelled", "info");
+				return;
+			}
 			if (choice === "yes") {
 				state = { mode: "awaiting-fix-validation", findings, index };
 				pi.sendUserMessage([
@@ -548,7 +554,8 @@ export default function (pi: ExtensionAPI) {
 		while (true) {
 			const choice = await ui.select(ctx, `Fix validation ${index + 1}/${findings.length}`, ["ok", "iterate with a prompt"]);
 			if (ui.isDisposed) return;
-			if (!choice || choice === "ok") {
+			if (!choice) { state = { mode: "idle" }; ctx.ui.notify("Review cancelled", "info"); return; }
+			if (choice === "ok") {
 				await processNextFinding(ctx, findings, index + 1);
 				return;
 			}
@@ -556,6 +563,7 @@ export default function (pi: ExtensionAPI) {
 			if (choice === "iterate with a prompt") {
 				const prompt = await ui.editor(ctx, "Iteration prompt for the fix");
 				if (ui.isDisposed) return;
+				if (prompt === undefined) { state = { mode: "idle" }; ctx.ui.notify("Review cancelled", "info"); return; }
 				const trimmed = prompt?.trim();
 				if (!trimmed) {
 					ctx.ui.notify("Empty or cancelled prompt", "warning");
@@ -579,20 +587,12 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.on("tool_call", (event) => {
-		if (state.mode === "awaiting-check") {
+		if (state.mode === "awaiting-check" || (state.mode === "awaiting-review" && state.pullRequest)) {
 			if (event.toolName === "read") return;
-			const command = isToolCallEventType("bash", event) ? event.input.command : undefined;
-			// Limit shell access to committed-snapshot inspection. Even a shell
-			// fallback must not publish on GitHub or alter the working tree.
-			if (command && /^git(?:\s+-C\s+(?:"[^"]*"|'[^']*'|\S+))?\s+(?:show|diff|log|ls-tree|cat-file|rev-parse)\s/.test(command)
-				&& !/[;|&<>`$\n\r]/.test(command)
-				&& !/--(?:output|ext-diff|textconv|no-index|filters)\b/.test(command.replace(/['"\\]/g, ""))) return;
-			return { block: true, reason: "Comment checking is read-only: use read or a single git show/diff/log/ls-tree/cat-file/rev-parse command. No tests, mutations, or GitHub actions." };
+			if (isToolCallEventType("bash", event) && isSnapshotInspection(event.input.command)) return;
+			return { block: true, reason: "PR inspection is read-only: use read or a single snapshot Git command; diff/show/log require --no-ext-diff --no-textconv. No tests, mutations, or GitHub actions." };
 		}
 		if (state.mode !== "awaiting-review") return;
-		if (state.pullRequest && (event.toolName === "edit" || event.toolName === "write")) {
-			return { block: true, reason: "PR comment mode is read-only. Do not apply local fixes." };
-		}
 		if (state.testExecution === "run") return;
 
 		const command = isToolCallEventType("bash", event)
@@ -600,7 +600,7 @@ export default function (pi: ExtensionAPI) {
 			: isToolCallEventType("powershell", event)
 				? event.input.command
 				: undefined;
-		if (!command || !isTestRunnerCommand(command)) return;
+		if (typeof command !== "string" || !isTestRunnerCommand(command)) return;
 
 		return {
 			block: true,
@@ -754,14 +754,16 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		let pr: PullRequest | undefined;
-		if (args.trim()) pr = parsePullRequest(args);
+		const baseOption = args.trim().match(/^--base\s+([^\s-]\S*)$/);
+		if (args.trim() && !baseOption) pr = parsePullRequest(args);
 		const options = pr ? { testExecution: "skip" as const, action: "comment" as const } : await chooseReviewOptions(ctx, ui);
 		if (!options) return;
 		if (options.action === "check") {
 			await generateCommentCheck(ctx, ui, workspaceRoot);
 			return;
 		}
-		const { testExecution } = options;
+		// PR publication mode remains inspection-only even if tests were selected before the mode.
+		const testExecution = options.action === "comment" ? "skip" : options.testExecution;
 		if (options.action === "comment" && !pr) {
 			const url = await ui.input(ctx, "GitHub PR URL", "https://github.com/owner/repo/pull/123");
 			if (!url?.trim()) {
@@ -774,24 +776,26 @@ export default function (pi: ExtensionAPI) {
 		const pullRequest = pr ? await preparePullRequest(pr, workspaceRoot, remoteUrls) : undefined;
 		const [branch, base] = await Promise.all([
 			runGit(["branch", "--show-current"], workspaceRoot),
-			pullRequest ? Promise.resolve(pullRequest.base) : resolveBaseRef(workspaceRoot),
+			pullRequest ? Promise.resolve(pullRequest.base) : resolveBaseRef(workspaceRoot, baseOption?.[1]),
 		]);
 		if (!base) {
 			ctx.ui.notify("Could not determine a baseline branch for the committed-range review", "warning");
 			return;
 		}
 
-		const head = pullRequest?.head ?? "HEAD";
+		const head = pullRequest?.head ?? await runGit(["rev-parse", "HEAD"], workspaceRoot);
+		const indexBefore = pullRequest ? undefined : await runGit(["diff", "--cached", "--raw", "-z", "--no-abbrev"], workspaceRoot);
 		const [commitLog, branchNameStatus, branchStat, branchDiff, stagedNameStatus, stagedStat, stagedDiff] = await Promise.all([
 			runGit(["log", "--no-merges", "--format=%h %s%n%b", `${base}..${head}`], workspaceRoot),
-			runGit(["diff", "--name-status", base, head], workspaceRoot),
+			runGit(["diff", "--name-status", "-z", base, head], workspaceRoot),
 			runGit(["diff", "--stat", "--no-color", base, head], workspaceRoot),
 			runGit(["diff", "--no-color", "--find-renames", "--find-copies", "--diff-algorithm=histogram", base, head], workspaceRoot),
-			pullRequest ? Promise.resolve("") : runGit(["diff", "--cached", "--name-status"], workspaceRoot),
+			pullRequest ? Promise.resolve("") : runGit(["diff", "--cached", "--name-status", "-z"], workspaceRoot),
 			pullRequest ? Promise.resolve("") : runGit(["diff", "--cached", "--stat", "--no-color"], workspaceRoot),
 			pullRequest ? Promise.resolve("") : runGit(["diff", "--cached", "--no-color", "--find-renames", "--find-copies", "--diff-algorithm=histogram"], workspaceRoot),
 		]);
 
+		if (!pullRequest && indexBefore !== await runGit(["diff", "--cached", "--raw", "-z", "--no-abbrev"], workspaceRoot)) throw new Error("The index changed during review preparation; retry /review");
 		const renderedBranchDiff = renderDiffByFile(branchDiff, "[No committed branch changes]");
 		const renderedStagedDiff = renderDiffByFile(stagedDiff, "[No staged changes]");
 		const datadogAgentWorkspace = isDatadogAgentRepository(remoteUrls);
@@ -799,7 +803,7 @@ export default function (pi: ExtensionAPI) {
 		const prompt = [
 			pullRequest ? `Perform a code review of ${pullRequest.url} at commit ${pullRequest.head}, relative to its PR merge base.`
 				: "Perform a code review of committed branch changes relative to the baseline and staged index changes.",
-			pullRequest ? "Scope boundary: review only the supplied committed PR range. Staged, unstaged, and untracked changes are excluded. Read committed file snapshots rather than working-tree files."
+			pullRequest ? "Scope boundary: review only the supplied committed PR range. Staged, unstaged, and untracked changes are excluded. Read committed file snapshots rather than working-tree files. Use git show/diff/log with --no-ext-diff --no-textconv."
 				: "Scope boundary: base the review only on the committed range and staged changes supplied below. Do not inspect, mention, or draw conclusions from unstaged or untracked working-tree changes; they are intentionally excluded.",
 			pullRequest ? "PR comment mode: do not modify local files or post anything to GitHub. The extension will ask the user which findings to publish as separate inline review threads after all decisions. Never use general PR comments as a fallback."
 				: "Staged changes are applied on top of the current branch HEAD.",
@@ -832,29 +836,30 @@ export default function (pi: ExtensionAPI) {
 				? "- Report every test command run and its outcome. Clearly state any relevant tests that could not be run."
 				: "- Do not report unrun tests as a failure; state only validation that you recommend.",
 			renderedBranchDiff.truncated || renderedStagedDiff.truncated
-				? "- Some per-file diffs are truncated or omitted after prioritization; explicitly mention that the review may be incomplete and name any relevant unreviewed files from the exhaustive file lists."
+				? "- Some per-file diffs are truncated or omitted after prioritization; explicitly mention that the review may be incomplete and name any relevant unreviewed files from the supplied file lists. File lists and commit logs can also be truncated; explicitly state missing coverage."
 				: undefined,
 			"",
 			`Workspace root: ${workspaceRoot}`,
 			`Current branch: ${branch || "detached HEAD"}`,
 			`Baseline commit: ${base}`,
+			baseOption ? `Baseline reference: ${baseOption[1]}` : undefined,
 			"",
 			"Branch commits since baseline:",
 			"```",
-			commitLog || "[No branch commits found]",
+			truncate(commitLog, 20_000).text || "[No branch commits found]",
 			"```",
 			"",
 			"Committed branch change surface:",
 			summarizeChangeSurface(branchNameStatus, branchDiff, "[No committed branch changes]"),
 			"",
-			"Committed branch changes - exhaustive file list:",
+			"Committed branch changes - file list (bounded):",
 			"```",
-			branchNameStatus || "[No committed branch changes]",
+			truncate(parseChangedFiles(branchNameStatus).map(file => `${file.status}\t${JSON.stringify(file.path)}`).join("\n"), 20_000).text || "[No committed branch changes]",
 			"```",
 			"",
 			"Committed branch changes - stat:",
 			"```",
-			branchStat || "[No committed branch changes]",
+			truncate(branchStat, 12_000).text || "[No committed branch changes]",
 			"```",
 			"",
 			"Committed branch changes - per-file diff (prioritized):",
@@ -865,14 +870,14 @@ export default function (pi: ExtensionAPI) {
 			"Staged change surface:",
 			summarizeChangeSurface(stagedNameStatus, stagedDiff, "[No staged changes]"),
 			"",
-			"Staged changes - exhaustive file list:",
+			"Staged changes - file list (bounded):",
 			"```",
-			stagedNameStatus || "[No staged changes]",
+			truncate(parseChangedFiles(stagedNameStatus).map(file => `${file.status}\t${JSON.stringify(file.path)}`).join("\n"), 20_000).text || "[No staged changes]",
 			"```",
 			"",
 			"Staged changes - stat:",
 			"```",
-			stagedStat || "[No staged changes]",
+			truncate(stagedStat, 12_000).text || "[No staged changes]",
 			"```",
 			"",
 			"Staged changes - per-file diff (prioritized):",
@@ -912,7 +917,7 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 	pi.registerCommand("review", { description: "Review changes or check existing comments: /review check URL [--just-me]", handler: async (args, ctx) => { await ctx.waitForIdle(); await runReview(ctx, args); } });
-	registerWebCommand("review", async (args) => {
+	const web = registerWebCommand("review", async (args) => {
 		if (!current) return;
 		if (!current.isIdle()) { current.ui.notify("Wait for the agent to finish before starting a review", "warning"); return; }
 		await runReview(current, args);

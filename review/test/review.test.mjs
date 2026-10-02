@@ -320,14 +320,16 @@ test("PR URL argument skips setup, fetches and checks out the PR head", async (t
 	assert.equal((await emit("tool_call", { toolName: "bash", input: { command: "go test ./..." } })).block, true);
 	assert.equal((await emit("tool_call", { toolName: "edit", input: {} })).block, true);
 	assert.equal((await emit("tool_call", { toolName: "write", input: {} })).block, true);
+	assert.equal((await emit("tool_call", { toolName: "bash", input: { command: "rm protected" } })).block, true);
+	assert.equal((await emit("tool_call", { toolName: "publish_custom", input: {} })).block, true);
 });
 
-test("interactive PR mode asks for URL and honors requested tests", async (t) => {
+test("interactive PR mode asks for URL and stays read-only even when tests were requested", async (t) => {
 	const { dialogs, sent, emit } = await setupPR(t, [RUN_TESTS, COMMENT_ON_PR], { args: "", inputs: [PR_URL] });
 	assert.equal(dialogs.length, 3);
 	assert.match(dialogs[2].prompt, /PR URL/);
-	assert.match(sent[0].text, /Test execution is requested/);
-	assert.equal(await emit("tool_call", { toolName: "bash", input: { command: "go test ./..." } }), undefined);
+	assert.match(sent[0].text, /Test execution is intentionally disabled/);
+	assert.equal((await emit("tool_call", { toolName: "bash", input: { command: "go test ./..." } })).block, true);
 	assert.equal((await emit("tool_call", { toolName: "edit", input: {} })).block, true);
 });
 
@@ -823,7 +825,7 @@ test("check mode guards tests, writes, publishing tools, and shell mutations but
 	for (const toolName of ["write", "edit", "github_publish", "powershell"]) {
 		assert.equal((await emit("tool_call", { toolName, input: {} })).block, true);
 	}
-	for (const command of ["git show HEAD:parser.go", "git diff HEAD~1 HEAD -- parser.go", "git log -p -- parser.go", "git -C '/tmp/checkout with spaces' show HEAD:parser.go"]) {
+	for (const command of ["git show --no-ext-diff --no-textconv HEAD:parser.go", "git diff --no-ext-diff --no-textconv HEAD~1 HEAD -- parser.go", "git log --no-ext-diff --no-textconv -p -- parser.go", "git -C '/tmp/checkout with spaces' show --no-ext-diff --no-textconv HEAD:parser.go"]) {
 		assert.equal(await emit("tool_call", { toolName: "bash", input: { command } }), undefined);
 	}
 });
@@ -943,4 +945,26 @@ test("Just me starts a comment check using gh auth status when the Git email can
 	assert.match(notifications.at(-1).message, /opened by @Test/);
 	await emit("agent_end", { messages: [checked("T1", "fixed")] });
 	assert.equal(mutations(mock).length, 0);
+});
+
+test("cancelling a local finding stops instead of opening the next finding", async t => {
+	const { emit, dialogs, notifications } = await setup(t, [SKIP_TESTS, FIX_LOCALLY, undefined]);
+	await emit("agent_end", { messages: [assistant(`${FINDING}\n\n${LOW_FINDING}`)] });
+	assert.equal(dialogs.length, 3); assert.match(notifications.at(-1).message, /Review cancelled/);
+	await emit("agent_end", { messages: [assistant(LOW_FINDING)] }); assert.equal(dialogs.length, 3);
+});
+
+test("cancelling fix validation stops rather than accepting the fix", async t => {
+	const { emit, dialogs, notifications, sent } = await setup(t, [SKIP_TESTS, FIX_LOCALLY, "yes", undefined]);
+	await emit("agent_end", { messages: [assistant(`${FINDING}\n\n${LOW_FINDING}`)] });
+	assert.equal(sent.length, 2);
+	await emit("agent_end", { messages: [assistant("Fixed")] });
+	assert.equal(dialogs.length, 4); assert.match(notifications.at(-1).message, /Review cancelled/);
+});
+
+test("local review accepts an explicit base and reports generic test files", async t => {
+	const { sent } = await setup(t, [SKIP_TESTS, FIX_LOCALLY], { args: "--base main", beforeReview: ({cwd, git}) => {
+		writeFileSync(join(cwd, "bounds.test.ts"), "test('bounds', () => {});\n"); git("add", "."); git("commit", "-m", "tests");
+	} });
+	assert.match(sent[0].text, /Baseline reference: main/); assert.match(sent[0].text, /Test files added \(1\): bounds.test.ts/);
 });

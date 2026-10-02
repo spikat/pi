@@ -1,6 +1,6 @@
 {
   "name": "@spikat/pi-review",
-  "version": "1.4.1",
+  "version": "1.5.0",
   "description": "Review Git changes in Pi with local fixes or per-issue inline GitHub PR threads",
   "license": "MIT",
   "type": "module",
@@ -19,6 +19,9 @@
   "files": [
     "index.ts",
     "web-ui.ts",
+    "inspection.ts",
+    "findings.ts",
+    "web-command.ts",
     "comments.ts",
     "inline.ts",
     "README.md",

@@ -25,7 +25,7 @@ Without an argument, an interactive `/review` starts with:
 
 **Check comments** instead asks for a PR URL and a scope: **All authors** (default) or **Just me**. It does not run tests or generate local fixes.
 
-The first item in each dialog is the default. If the last commit's author matches the current Git user, the defaults are **run tests + fix locally**. Otherwise, the defaults are **skip tests + comment on the PR**. Identity is compared using the last commit's author email and `git config user.email` (case-insensitive), falling back to the author name and `user.name` when email comparison is unavailable. Both choices remain independently overridable.
+The first item in each dialog is the default. If the last commit's author matches the current Git user, the defaults are **run tests + fix locally**. Otherwise, the defaults are **skip tests + comment on the PR**. Identity is compared using the last commit's author email and `git config user.email` (case-insensitive), falling back to the author name and `user.name` when email comparison is unavailable. Local review can override the test choice. PR comment mode is always inspection-only and forces skipped test execution, even if run-tests was selected before choosing that mode.
 
 Passing a PR URL directly bypasses both setup dialogs and selects **skip tests + comment on the PR** automatically:
 
@@ -33,7 +33,9 @@ Passing a PR URL directly bypasses both setup dialogs and selects **skip tests +
 /review https://github.com/DataDog/datadog-agent/pull/55843
 ```
 
-When tests are selected, the review asks the agent to determine and run every relevant test, then report each command and outcome. When skipped, the agent may inspect test files and recommend validation, but it must not run tests; recognized test-runner commands are also blocked while the review is generated. Without a terminal/RPC UI or an active Pi Web connection, `/review` defaults to skipped tests and local mode; a PR URL still selects PR mode, but no comments are posted without interactive finding selection.
+For local review, `/review --base <ref>` selects an explicit baseline (merge-base with HEAD). Git collection disables external diff/textconv drivers and has a 30-second subprocess deadline. Committed diffs use a captured commit ID, path lists use NUL-separated output, and index metadata is checked before and after collection. A changed index stops preparation. This detects races but is not an atomic filesystem snapshot.
+
+When tests are selected in local mode, the review asks the agent to determine and run every relevant test, then report each command and outcome. When skipped, the agent may inspect test files and recommend validation, but it must not run tests; recognized test-runner commands are also blocked while the review is generated. This recognition is best-effort, not a sandbox: opaque scripts and wrappers may escape it. PR inspection blocks every tool except `read` and literal snapshot Git commands; `git show/diff/log` require `--no-ext-diff --no-textconv`. Without a terminal/RPC UI or an active Pi Web connection, `/review` defaults to skipped tests and local mode; a PR URL still selects PR mode, but no comments are posted without interactive finding selection.
 
 ## Check existing PR comments
 
@@ -85,9 +87,11 @@ The agent provides one location marker inside each finding:
 
 Before sending anything, the extension validates **all selected locations** against the paginated GitHub PR file patches and checks that the PR head still matches the reviewed commit. Missing/invalid anchors, unavailable patches (for example binary or very large diffs), or a changed head stop the entire batch before publication. Unpublishable findings remain visible in the conversation and can be declined in the selection dialog. There is **no fallback to general PR comments**.
 
+Cancelling a local finding, fix validation or iteration editor stops the local workflow, rather than skipping ahead or accepting a fix. Web command registrations are owned and removed on session shutdown/reload.
+
 If no findings are selected, nothing is posted. Cancelling a finding dialog discards the entire pending batch. Publication is sequential, not atomic: if a submission fails, the extension stops, reports which comment failed and how many preceding comments were confirmed posted, and leaves subsequent comments unattempted. It never automatically retries, to avoid duplicates; check the PR before retrying, since the failed request may still have reached GitHub.
 
-Diffs are rendered per file (up to 12,000 characters per file and 50,000 characters per change set), while the full changed-file list is retained. When a limit is reached, patches are prioritized for `pkg/security/`, tests, build constraints, Go module metadata, rules, and configuration files. The prompt also includes a change-surface summary: added, deleted, renamed, test, Go-module, and build-constraint changes.
+Diffs are rendered per file (up to 12,000 characters per file and 50,000 characters per change set), with changed-file lists capped at 20,000 characters, stats at 12,000 and the commit log at 20,000. Truncation is explicitly marked; the review must state missing coverage. When a limit is reached, patches are prioritized for `pkg/security/`, tests (including root JS/TS, Python and Rust test paths), build constraints, Go module metadata, rules, and configuration files. The prompt also includes a change-surface summary: added, deleted, renamed, test, Go-module, and build-constraint changes.
 
 The review looks for, among other things:
 
