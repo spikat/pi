@@ -689,7 +689,7 @@ export default function (pi: ExtensionAPI) {
 		try { login = await currentGitLogin(runCommand, pullRequest); }
 		catch (error) {
 			if (justMe) throw error;
-			ctx.ui.notify("GitHub identity could not be mapped from Git; checking all authors without assuming which comments are yours", "warning");
+			ctx.ui.notify("GitHub identity could not be determined from Git or gh auth status; checking all authors without assuming which comments are yours", "warning");
 		}
 		const context = await loadCommentThreads(runCommand, pullRequest);
 		// A thread belongs to its initial author, not every participant replying.

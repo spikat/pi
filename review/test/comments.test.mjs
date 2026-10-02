@@ -49,11 +49,16 @@ test("GraphQL partial errors fail closed rather than silently skipping comments"
 });
 
 for (const mode of ["public", "private", "noreply", "search", "unmapped"]) {
-	test(`Just me resolves the local Git email via ${mode}, never gh authentication alone`, async () => {
+	test(`Just me prefers Git email mapping via ${mode}, then falls back to gh auth status`, async () => {
 		const run = async (command, args) => {
 			if (command === "git") {
 				if (args[1] === "github.user") throw new Error("unset");
 				return mode === "noreply" ? "123+Local@users.noreply.github.com" : "local@example.com";
+			}
+			if (args[0] === "auth") {
+				assert.equal(mode, "unmapped", "A successful Git email mapping must take priority");
+				assert.deepEqual(args, ["auth", "status", "--active", "--hostname", "github.com", "--json", "hosts", "--jq", '.hosts["github.com"] | map({login,active,state})']);
+				return JSON.stringify([{ login: "ActiveAccount", active: true, state: "success" }]);
 			}
 			const endpoint = args[3];
 			if (endpoint === "user") return JSON.stringify({ login: "Authenticated", email: mode === "public" ? "local@example.com" : "other@example.com" });
@@ -62,10 +67,65 @@ for (const mode of ["public", "private", "noreply", "search", "unmapped"]) {
 			if (endpoint.startsWith("search/users")) return JSON.stringify(mode === "search" ? { total_count: 1, items: [{ login: "Local" }] } : { total_count: 0 });
 			throw new Error(`Unexpected endpoint ${endpoint}`);
 		};
-		if (mode === "unmapped") await assert.rejects(currentGitLogin(run, pr), /Cannot map the local Git email/);
-		else assert.equal(await currentGitLogin(run, pr), ["public", "private"].includes(mode) ? "Authenticated" : "Local");
+		assert.equal(await currentGitLogin(run, pr), mode === "unmapped" ? "ActiveAccount" : ["public", "private"].includes(mode) ? "Authenticated" : "Local");
 	});
 }
+
+for (const reason of ["missing email", "private email", "API failure", "ambiguous email search"]) {
+	test(`gh auth status recovers identity with ${reason} and multiple configured accounts`, async () => {
+		const calls = [];
+		const run = async (command, args) => {
+			calls.push({ command, args });
+			if (command === "git") {
+				if (args[1] === "github.user" || reason === "missing email") throw new Error("unset");
+				return "private@example.com";
+			}
+			if (args[0] === "auth") return JSON.stringify([
+				{ login: "Inactive", active: false, state: "success" },
+				{ login: "Active", active: true, state: "success" },
+			]);
+			if (reason === "API failure") throw new Error("Identity API unavailable");
+			if (args[3] === "user") return JSON.stringify({ login: "Active", email: null });
+			if (args[3] === "user/emails") throw new Error("No private email scope");
+			return JSON.stringify({ total_count: reason === "ambiguous email search" ? 2 : 0, items: [{ login: "WrongAccount" }] });
+		};
+		assert.equal(await currentGitLogin(run, pr), "Active");
+		assert.ok(calls.some(({ args }) => args[0] === "auth" && args[1] === "status"));
+		assert.ok(calls.every(({ args }) => !args.includes("--show-token")));
+		if (reason === "missing email") assert.ok(!calls.some(({ args }) => args[0] === "api"));
+	});
+}
+
+for (const [name, result] of [
+	["no account", []], ["inactive only", [{ login: "Inactive", active: false, state: "success" }]],
+	["failed authentication", [{ login: "Expired", active: true, state: "error" }]],
+	["multiple active accounts", [{ login: "One", active: true, state: "success" }, { login: "Two", active: true, state: "success" }]],
+	["missing health status", [{ login: "Unknown", active: true }]], ["malformed JSON", "invalid-json"],
+	["invalid login", [{ login: "not a login", active: true, state: "success" }]], ["command failure", null],
+]) {
+	test(`gh auth status rejects ${name} with an actionable error and no authentication output`, async () => {
+		const run = async (command) => {
+			if (command === "git") throw new Error("unset");
+			if (result === null) throw new Error("Sensitive authentication output must not be shown");
+			return typeof result === "string" ? result : JSON.stringify(result);
+		};
+		await assert.rejects(currentGitLogin(run, pr), (error) => {
+			assert.match(error.message, /gh auth login --hostname github.com/);
+			assert.ok(!error.message.includes("Sensitive authentication output"));
+			return true;
+		});
+	});
+}
+
+test("an explicit github.user overrides the authenticated account", async () => {
+	const run = async (command, args) => {
+		if (command === "git") { assert.equal(args[1], "github.user"); return "Explicit"; }
+		assert.equal(args[0], "api", "Must not invoke gh auth status for an explicit identity");
+		assert.equal(args[3], "users/Explicit");
+		return JSON.stringify({ login: "Explicit" });
+	};
+	assert.equal(await currentGitLogin(run, pr), "Explicit");
+});
 
 test("general replies reference the original URL without attempting resolve/unresolve", async () => {
 	const { run, calls } = runner(() => ({ id: 1 }));

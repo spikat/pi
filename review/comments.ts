@@ -81,24 +81,38 @@ export async function loadCommentThreads(run: Run, pr: CheckPR): Promise<Comment
 	return threads;
 }
 
-/** Never equate the authenticated gh account with the local Git identity blindly. */
+/** Prefer the Git identity; fall back to the active gh account for private/unmapped emails. */
 export async function currentGitLogin(run: Run, pr: CheckPR): Promise<string> {
 	const config = async (key: string) => { try { return (await run("git", ["config", key], pr.cwd)).trim(); } catch { return ""; } };
 	const explicit = await config("github.user");
 	if (explicit) return (await api(run, pr, [`users/${encodeURIComponent(explicit)}`])).login;
 	const email = (await config("user.email")).toLowerCase();
-	if (!email) throw new Error("Just me requires git config user.email (or an explicit git config github.user)");
-	const noreply = email.match(/^(?:\d+\+)?([^@]+)@users\.noreply\.github\.com$/);
-	if (noreply) return (await api(run, pr, [`users/${encodeURIComponent(noreply[1]!)}`])).login;
-	const user = await api(run, pr, ["user"]);
-	if (user.email?.toLowerCase() === email) return user.login;
+	if (email) {
+		try {
+			const noreply = email.match(/^(?:\d+\+)?([^@]+)@users\.noreply\.github\.com$/);
+			if (noreply) return (await api(run, pr, [`users/${encodeURIComponent(noreply[1]!)}`])).login;
+			const user = await api(run, pr, ["user"]);
+			if (user.email?.toLowerCase() === email) return user.login;
+			try {
+				const emails = await api(run, pr, ["user/emails"]);
+				if (emails.some((value: any) => value.verified && value.email?.toLowerCase() === email)) return user.login;
+			} catch { /* Private email access may require an extra scope. */ }
+			const search = await api(run, pr, [`search/users?q=${encodeURIComponent(`${email} in:email`)}`]);
+			if (search.total_count === 1 && search.items?.[0]?.login) return search.items[0].login;
+		} catch { /* Identity lookup failures must not prevent using the active gh account. */ }
+	}
 	try {
-		const emails = await api(run, pr, ["user/emails"]);
-		if (emails.some((value: any) => value.verified && value.email?.toLowerCase() === email)) return user.login;
-	} catch { /* Private email access may require an extra scope. */ }
-	const search = await api(run, pr, [`search/users?q=${encodeURIComponent(`${email} in:email`)}`]);
-	if (search.total_count === 1 && search.items?.[0]?.login) return search.items[0].login;
-	throw new Error("Cannot map the local Git email to a GitHub login. Set git config github.user YOUR_LOGIN explicitly, then retry Just me.");
+		// JSON auth status exits successfully even for failed authentication:
+		// require a healthy active account explicitly. Never request/show tokens.
+		const accounts = JSON.parse(await run("gh", ["auth", "status", "--active", "--hostname", "github.com", "--json", "hosts",
+			"--jq", '.hosts["github.com"] | map({login,active,state})'], pr.cwd));
+		if (Array.isArray(accounts)) {
+			const active = accounts.filter((account) => account?.active === true && account.state === "success"
+				&& typeof account.login === "string" && /^[a-z0-9][a-z0-9-]{0,38}$/i.test(account.login));
+			if (active.length === 1) return active[0].login;
+		}
+	} catch { /* Do not include raw authentication output in errors. */ }
+	throw new Error("Cannot determine the GitHub login from Git or gh auth status. Authenticate with gh auth login --hostname github.com (or switch the active account with gh auth switch --hostname github.com), or set git config github.user YOUR_LOGIN explicitly, then retry Just me.");
 }
 
 export function checkPrompt(pr: CheckPR, thread: CommentThread, all: CommentThread[], index: number, total = all.length): string {

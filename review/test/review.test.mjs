@@ -169,6 +169,7 @@ if (args.includes("graphql")) {
   } else result = { data: { repository: { pullRequest: { reviewThreads: { nodes: threads, pageInfo: { hasNextPage: false } } } } } };
 } else if (args.some((arg) => /\\/files\\?/.test(arg))) result = ${JSON.stringify(options.files ?? [{ filename: "parser.go", patch: "@@ -1 +1,2 @@\n package parser\n+// changed" }])};
 else if (args.some((arg) => /\\/(reviews|comments)\\?/.test(arg))) result = [];
+else if (args[0] === "auth" && args[1] === "status") result = [{ login: "InactiveAccount", active: false, state: "success" }, { login: "Test", active: true, state: "success" }];
 else if (args.includes("user")) result = { login: "Test", email: "test@example.com" };
 else if (args.some((arg) => arg.startsWith("users/"))) result = { login: args.find((arg) => arg.startsWith("users/")).slice(6) };
 const history = readFileSync(${JSON.stringify(logPath)}, "utf8").trim().split("\\n").map(JSON.parse);
@@ -928,4 +929,18 @@ test("PR head changing before inline publication rejects all selected findings",
 	await emit("agent_end", { messages: [assistant(FINDING)] });
 	assert.equal(mock.calls().filter(({ args }) => args.includes("POST")).length, 0);
 	assert.match(notifications.at(-1).message, /PR head changed/);
+});
+
+test("Just me starts a comment check using gh auth status when the Git email cannot be mapped", async (t) => {
+	const { emit, mock, sent, notifications } = await setupPR(t, [LEAVE_COMMENT], {
+		args: `check ${PR_URL} --just-me`, mock: { threads: [ghThread("T1", "Test"), ghThread("T2", "InactiveAccount")] },
+		afterMock: ({ git }) => git("config", "user.email", "unmapped-private@example.com"),
+	});
+	assert.match(sent[0].text, /GitHub @Test/);
+	assert.match(sent[0].text, /Checking 1 comments/);
+	assert.ok(!sent[0].text.includes("InactiveAccount"));
+	assert.ok(mock.calls().some(({ args }) => args[0] === "auth" && args[1] === "status"));
+	assert.match(notifications.at(-1).message, /opened by @Test/);
+	await emit("agent_end", { messages: [checked("T1", "fixed")] });
+	assert.equal(mutations(mock).length, 0);
 });
