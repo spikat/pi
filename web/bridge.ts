@@ -113,7 +113,7 @@ export class LocalWebBridge implements WebBridge {
 	emit(type: string, payload: Record<string, unknown>): void { this.#send({ type: "agent_event", event: { type, ...payload, timestamp: Date.now() } }); }
 
 	openDecision<T>(dialog: Omit<WebDialog, "id">): WebDecision<T> | undefined {
-		if (!this.#wanted) return undefined;
+		if (!this.#wanted || this.#pending.size >= 64) return undefined;
 		const id = randomUUID();
 		let settle!: (value: T) => void;
 		const promise = new Promise<T>((resolve) => { settle = resolve; });
@@ -132,7 +132,7 @@ export class LocalWebBridge implements WebBridge {
 	registerCommand(name: string, handler: (args: string) => Promise<void> | void): () => void {
 		this.#commands.set(name, handler);
 		this.#send({ type: "agent_update", metadata: this.#metadata });
-		return () => this.#commands.delete(name);
+		return () => { if (this.#commands.get(name) === handler) this.#commands.delete(name); };
 	}
 
 	onInput(handler: (text: string) => void): void { this.#inputHandler = handler; }
@@ -184,8 +184,8 @@ export class LocalWebBridge implements WebBridge {
 
 	#send(value: unknown): void {
 		const serialized = JSON.stringify(value);
-		if (this.#socket?.readyState === WebSocket.OPEN) { this.#socket.send(serialized); return; }
-		if (this.#outbox.length < 200) this.#outbox.push(serialized);
+		if (this.#socket?.readyState === WebSocket.OPEN) { if (this.#socket.bufferedAmount <= 2 * 1024 * 1024) this.#socket.send(serialized); return; }
+		if (this.#outbox.length < 200 && this.#outbox.reduce((bytes, entry) => bytes + Buffer.byteLength(entry), 0) + Buffer.byteLength(serialized) <= 2 * 1024 * 1024) this.#outbox.push(serialized);
 	}
 
 	#receive(raw: string): void {

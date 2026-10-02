@@ -34,10 +34,11 @@ function get(options: Parameters<typeof request>[1]): Promise<{ status: number; 
 function nextMessage(socket: WebSocket): Promise<Record<string, unknown>> { return new Promise((resolve) => socket.once("message", (value) => resolve(JSON.parse(String(value)) as Record<string, unknown>))); }
 function open(url: string, options: WebSocket.ClientOptions): Promise<WebSocket> { return new Promise((resolve, reject) => { const socket = new WebSocket(url, options); socket.once("open", () => resolve(socket)); socket.once("error", reject); }); }
 
-test("HTTPS bridge renews certificates that are close to expiry", async () => {
+for (const failure of ["near expiry", "mismatched key"]) test(`HTTPS bridge renews certificates with ${failure}`, async () => {
 	const runtime = await mkdtemp(join(tmpdir(), "pi-web-")); const port = await freePort();
-	const expiring = selfsigned.generate([{ name: "commonName", value: "localhost" }], { days: 1, keySize: 2048 });
-	await writeFile(join(runtime, "localhost-key.pem"), expiring.private);
+	const expiring = selfsigned.generate([{ name: "commonName", value: "localhost" }], { days: failure === "near expiry" ? 1 : 365, keySize: 2048 });
+	const key = failure === "mismatched key" ? selfsigned.generate([{ name: "commonName", value: "localhost" }], { days: 365, keySize: 2048 }).private : expiring.private;
+	await writeFile(join(runtime, "localhost-key.pem"), key);
 	await writeFile(join(runtime, "localhost-cert.pem"), expiring.cert);
 	const child = spawn(process.execPath, [join(process.cwd(), "server.mjs")], { cwd: join(process.cwd()), env: { ...process.env, PI_WEB_RUNTIME_DIR: runtime, PI_WEB_PORT: String(port) }, stdio: "ignore" });
 	try {
@@ -80,7 +81,7 @@ test("HTTPS bridge authenticates the browser and relays agent state", async () =
 		assert.equal(health.status, 204);
 		const page = await get({ hostname: "localhost", port, path: `/?token=${state.browserToken}`, rejectUnauthorized: false });
 		assert.equal(page.status, 200); assert.match(page.body, /Show agent reasoning/); assert.match(page.body, /Desktop notifications/); assert.match(page.body, /Mute agent notifications/); assert.match(page.body, /Drop queued prompts/); assert.match(page.body, /Copy this agent message to the clipboard/); assert.match(page.body, /navigator\.clipboard\?\.writeText/); assert.match(page.body, /appendFileReferences/); assert.match(page.body, /fileViewer/); assert.match(page.body, /View source/); assert.match(page.body, /\.file-viewer>\.markdown\{box-sizing:border-box;padding:\.45rem \.8rem \.8rem\}/); assert.match(page.body, /focusFirstChange:true/); assert.match(page.body, /title:'Previous change'/); assert.match(page.body, /title:'Next change'/); assert.match(page.body, /scrollToDiffChange/); assert.match(page.body, /language==='python'/); assert.match(page.body, /syntax-target/); assert.match(page.body, /gitDiffRows/); assert.match(page.body, /isTableDivider/); assert.match(page.body, /appendDialogs\(messages,agent\)/); assert.match(page.body, /showThinking=false,showTools=false/); assert.match(page.body, /Validate current selection/); assert.match(page.body, /Enter a prompt for the assistant/); assert.match(page.body, /data\.summary/); assert.match(page.body, /gate-summary/); assert.match(page.body, /global-allow/); assert.match(page.body, /💾/);
-		assert.match(page.body, /fileAvailability=new Map/); assert.match(page.body, /function previewAvailability/); assert.match(page.body, /&check=1/); assert.match(page.body, /Close file view/); assert.match(page.body, /event\.key==='Escape'/); assert.match(page.body, /\.layout\.collapsed \.side>aside\{display:none\}/);
+		assert.match(page.body, /fileAvailability=new BoundedMap\(200\)/); assert.match(page.body, /function previewAvailability/); assert.match(page.body, /&check=1/); assert.match(page.body, /Close file view/); assert.match(page.body, /event\.key==='Escape'/); assert.match(page.body, /\.layout\.collapsed \.side>aside\{display:none\}/);
 		assert.match(page.body, /agentViews=new Map/); assert.match(page.body, /rememberAgentView\(selected\)/); assert.match(page.body, /value:agentViews\.get\(agent\.id\)\?\.draft\|\|''/); assert.match(page.body, /liveMessages\.scrollTop=view\.scrollTop/);
 		assert.match(page.body, /function notificationAllowed/); assert.match(page.body, /function syncNotificationSettings/); assert.match(page.body, /disabled:notificationsDisabled/);
 		assert.match(page.body, /dialog\.data\?\.multiline\?'textarea':'input'/);
@@ -94,6 +95,9 @@ test("HTTPS bridge authenticates the browser and relays agent state", async () =
 		agent.send(JSON.stringify({ type: "agent_hello", metadata: { id: "agent-1", cwd: runtime, commands: [], history: [] } }));
 		const joined = await nextMessage(browser); assert.equal(joined.type, "agent_join");
 		assert.equal((joined.agent as { id: string }).id, "agent-1");
+		agent.send(JSON.stringify({ type: "agent_update", metadata: { id: "other", cwd: {}, socket: null, events: null, dialogs: null, commands: {} } }));
+		const sanitized = await nextMessage(browser); assert.equal(sanitized.type, "agent_update");
+		assert.deepEqual(sanitized.agent, { id: "agent-1" });
 		agent.send(JSON.stringify({ type: "agent_event", event: { type: "queue", pending: 2, characters: 42, maxPending: 20, maxCharacters: 100000 } }));
 		const queued = await nextMessage(browser); assert.equal(queued.type, "agent_event"); assert.equal(((queued.event as { pending: number }).pending), 2);
 		const preview = await get({ hostname: "localhost", port, path: "/markdown?agent=agent-1&path=format.md", rejectUnauthorized: false, headers: { cookie } });
@@ -170,6 +174,14 @@ test("HTTPS bridge authenticates the browser and relays agent state", async () =
 		assert.deepEqual(await nextMessage(agent), { type: "rename", text: "Renamed agent" });
 		browser.send(JSON.stringify({ type: "disconnect", agentId: "agent-1" }));
 		assert.deepEqual(await nextMessage(agent), { type: "disconnect" });
+		agent.send(JSON.stringify({ type: "agent_bye" }));
+		assert.equal((await nextMessage(browser)).type, "agent_leave");
+		for (const type of ["clear_queue", "sync", "dialog_response", "rename", "disconnect"]) browser.send(JSON.stringify({ type, agentId: "agent-1", id: "gate-1", name: "late", value: true }));
+		browser.send("null"); agent.send("null");
+		agent.send(JSON.stringify({ type: "agent_event", event: { type: "late" } }));
+		await wait(100);
+		assert.equal((await get({ hostname: "127.0.0.1", port, path: "/health", rejectUnauthorized: false, headers: { "x-pi-web-agent-token": state.agentToken } })).status, 204);
+		assert.equal(child.exitCode, null);
 		agent.close(); browser.close();
 	} finally { child.kill("SIGTERM"); await rm(runtime, { recursive: true, force: true }); }
 });

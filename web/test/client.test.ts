@@ -4,7 +4,7 @@ import test from "node:test";
 
 // Exercise the actual dashboard functions without introducing a browser dependency.
 const serverSource = readFileSync(new URL("../server.mjs", import.meta.url), "utf8");
-const functions = ["appendDialogs", "applyEvent", "agentState"].map((name) => {
+const functions = ["appendDialogs", "applyEvent", "agentState", "browserSend"].map((name) => {
 	const source = serverSource.split("\n").find((line) => line.startsWith(`function ${name}(`));
 	assert.ok(source, `Missing client function ${name}`);
 	return source;
@@ -21,6 +21,7 @@ class Node {
 		this.children = children;
 	}
 	append(...children: unknown[]) { this.children.push(...children); }
+	replaceChildren(...children: unknown[]) { this.children = children; }
 }
 
 function client() {
@@ -29,7 +30,7 @@ function client() {
 		`let selected = "selected";\n${functions}\nreturn { appendDialogs, applyEvent, agentState };`)(
 		(tag: string, props: object, ...children: unknown[]) => new Node(tag, props, ...children),
 		(_agent: unknown, text: string) => { markdown.push(text); return new Node("markdown", {}, text); },
-		{ send: (data: string) => sent.push(JSON.parse(data)) }, drafts, () => assert.fail("Not a command dialog"),
+		{ readyState: 1, send: (data: string) => sent.push(JSON.parse(data)) }, drafts, () => assert.fail("Not a command dialog"),
 	);
 	return { api, sent, markdown, drafts };
 }
@@ -89,4 +90,43 @@ test("model completion cannot replace the waiting icon while a review question r
 	assert.deepEqual(api.agentState(agent), ["idle", "🙋"]);
 	agent.id = "other";
 	assert.deepEqual(api.agentState(agent), ["finished", "🏁"]);
+});
+
+test("thousands of browser events and messages stay bounded", () => {
+	const { api } = client(); const agent = { id: "selected", events: [] as any[], history: [] as any[] };
+	for (let i = 0; i < 3_000; i++) {
+		api.applyEvent(agent, { type: "tool_end", timestamp: i, payload: "x".repeat(4_000) });
+		api.applyEvent(agent, { type: "message_start", message: { role: "user", content: "x".repeat(20_000) } });
+	}
+	assert.ok(agent.events.length <= 300); assert.ok(JSON.stringify(agent.events).length < 530_000);
+	assert.ok(agent.history.length <= 64); assert.ok(JSON.stringify(agent.history).length < 530_000);
+});
+
+test("preview caches evict older entries", () => {
+	const source = serverSource.split("\n").find(line => line.startsWith("class BoundedMap")); assert.ok(source);
+	const Bounded = new Function(`${source}; return BoundedMap;`)(); const cache = new Bounded(3);
+	for (let i = 0; i < 100; i++) cache.set(i, i);
+	assert.deepEqual([...cache.keys()], [97, 98, 99]);
+});
+
+test("command approval choices and prompt drafts survive redraws", () => {
+	const source = serverSource.split("\n").find(line => line.startsWith("function commandDialog(")); assert.ok(source);
+	const sendSource = serverSource.split("\n").find(line => line.startsWith("function browserSend(")); assert.ok(sendSource);
+	const drafts = new Map(), sent: any[] = [];
+	const dialog = { id: "approval", data: { choices: [{ state: "undecided", args: 1, maxArgs: 1, displayWords: ["echo", "hello", "*"] }] } };
+	const render = new Function("el", "socket", "dialogDrafts", `${sendSource}\n${source}\nreturn commandDialog;`)((tag: string, props: object, ...children: unknown[]) => new Node(tag, props, ...children), { readyState: 1, send: (value: string) => sent.push(JSON.parse(value)) }, drafts);
+	const box = new Node("box"); render({ id: "agent" }, dialog, box);
+	const list = box.children[0] as Node, choice = list.children[0] as Node;
+	(choice.children[0] as Node).onclick!();
+	const promptRow = box.children[2] as Node; const prompt = control(promptRow, "input"); prompt.value = "Inspect instead"; prompt.oninput!();
+	const redraw = new Node("box"); render({ id: "agent" }, dialog, redraw);
+	assert.equal(control(redraw.children[2] as Node, "input").value, "Inspect instead");
+	(redraw.children[1] as Node).onclick!();
+	assert.equal(sent[0].value.choices[0].state, "project-allow");
+});
+
+test("disconnected browser actions fail explicitly", () => {
+	const source = serverSource.split("\n").find(line => line.startsWith("function browserSend(")); assert.ok(source); const alerts: string[] = [];
+	const send = new Function("socket", "window", `${source}; return browserSend;`)(undefined, { alert: (message: string) => alerts.push(message) });
+	assert.equal(send({ type: "input" }), false); assert.equal(alerts.length, 1);
 });

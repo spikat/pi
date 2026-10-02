@@ -31,7 +31,7 @@ Open that exact URL in a browser. The bridge uses a generated self-signed certif
 /web status        Report whether the current session is connected.
 ```
 
-The first `on` command selects the port. While a bridge has connected agents, another explicit port is rejected rather than silently splitting the dashboard into two local bridges. Use `/web on` in subsequent sessions to join it.
+The first `on` command selects the port. Startup is serialized with an interprocess lock; concurrent sessions discover the same healthy bridge and revalidate any explicit port. Certificate files are replaced atomically. While a bridge has connected agents, another explicit port is rejected rather than silently splitting the dashboard into two local bridges. Use `/web on` in subsequent sessions to join it.
 
 The bridge stops automatically a few seconds after the last connected Pi session exits or runs `/web off`. During local development, the detached bridge keeps the `server.mjs` code it loaded at startup; run `/web off` in every connected Pi session, wait a few seconds for the shared server to stop, then run `/web on` again (and reload the browser) after changing dashboard code.
 
@@ -43,7 +43,7 @@ The bridge stops automatically a few seconds after the last connected Pi session
 - The command input offers slash-command completion from Pi's public command list.
 - Agent replies are rendered as safe Markdown with headings, ordered and unordered lists, fenced and inline code, bold/emphasis, safe HTTP(S) links, block quotes, horizontal rules, and GitHub-style tables. Each reply has a **Copy** button that writes the original Markdown to the browser's local clipboard. Fenced blocks accept a language identifier such as <code>```md</code> and leading indentation. Tools and reasoning have distinct colors.
 - Project-file references in agent replies are checked against the connected local agent before becoming links. Previewable references—including `README.md`, `docs/build.md`, `main.go`, `server.ts`, `Makefile`, and `Dockerfile`—open a right-hand split view rather than a new tab; unavailable, binary, oversized, or out-of-project references remain plain text. The viewer has a close **×** control, a persistent **Close file view** button beside the agent actions, `Escape` support, line numbers, and lightweight source highlighting. Standalone file-activity cards are intentionally not shown. When Pi runs inside a Git working tree, references to files with an unstaged Git change gain a **(diff)** link. The server generates that view with `git diff` (working tree against the index), so untracked files and projects outside a Git working tree have no diff link. The diff viewer navigates between changed lines with **<** and **>** controls.
-- Each agent view displays only its three most recent user prompts and subsequent responses by default. **Show agent reasoning** and **Show commands and tool output** are disabled by default; enable either only when needed.
+- Each agent view displays only its three most recent user prompts and subsequent responses by default. Snapshots follow the active session branch, including tree navigation; abandoned branches are excluded. **Show agent reasoning** and **Show commands and tool output** are disabled by default; enable either only when needed.
 - The transcript opens at its newest content and follows live output only while the reader is already at the bottom, like `tail -f`. Streaming changes patch only the transcript element, without rebuilding the page or changing focus; scrolling up preserves the reading position, and activity from another agent updates only that agent's tab. Each agent tab also retains its unsent command-input draft and exact transcript scroll position while you visit other agents. Selecting an agent requests a fresh session-history snapshot from its Pi process to repair any missed browser event. **Clear displayed buffer** clears only the current browser view; it never changes the Pi session or agent history.
 - File previews are limited to recognized text/source formats (`.md`, `.go`, `.c`, `.ts`, `.txt`, `.cfg`, JSON, YAML, shell, and similar formats, plus `Makefile` and `Dockerfile`), are confined to the selected agent's project directory, reject binary files, and have a 512 KiB size limit.
 - Slash-command suggestions appear only after typing `/` in the larger command input.
@@ -60,7 +60,7 @@ When `@spikat/pi-commands-whitelist` and this package are both loaded in the sam
 
 With `@spikat/pi-review` **1.3.4 or later** loaded in the same process, `/review` works end-to-end from the dashboard, including a PR URL argument. Test/mode selection, the PR URL, finding-by-finding decisions, fix validation, and multiline iteration prompts are answerable in the browser. Findings are rendered as Markdown. In TUI mode, the first browser or terminal answer closes both views; in browser-only/RPC sessions, review uses browser dialogs while the bridge is active.
 
-The waiting icon remains active until all pending dialogs close, even if the model settles or session metadata changes. Review also reports working status during Git preparation and comment publication, and restores idle/completed status afterward. Selection and text drafts in review dialogs survive dashboard redraws.
+The waiting icon remains active until all pending dialogs close, even if the model settles or session metadata changes. Review also reports working status during Git preparation and comment publication, and restores idle/completed status afterward. Selection and text drafts in review dialogs, and command-approval selections/prompts, survive dashboard redraws.
 
 The existing bridge integration surface supports these optional dialog hints through `WebDialog.data`: `markdown: true` renders the detail as safe Markdown, `multiline: true` renders an input as a textarea, and `placeholder` sets the input hint. Existing callers without these hints retain their current controls.
 
@@ -71,6 +71,8 @@ The existing bridge integration surface supports these optional dialog hints thr
 - Runtime state, tokens, and the generated key are written with owner-only permissions under `$XDG_RUNTIME_DIR/pi-web` or `~/.pi/web`.
 - The token grants the ability to send messages to local Pi agents and read previewable text files inside their project directories. Do not share the initial URL.
 - This is local-user security, not a multi-user or network-exposed service. Do not forward the port to a LAN or the Internet without adding authentication and a hardened reverse-proxy design.
+
+Late authenticated actions toward disconnected agents are ignored safely. Duplicate live agent IDs are rejected. Browser event/history retention is capped by count and size, preview caches evict older entries, and transport queues/backpressure have size limits. Disconnected browser submissions show an error instead of discarding the composer draft. These measures favor availability over retaining every activity event; this transport is not an exactly-once delivery protocol.
 
 ## Limitations
 

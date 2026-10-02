@@ -1,6 +1,6 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { access, chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { request } from "node:https";
 import { dirname, join } from "node:path";
@@ -35,7 +35,7 @@ export async function readBridgeState(dir = runtimeDir()): Promise<BridgeState |
 export async function writeBridgeState(state: BridgeState, dir = runtimeDir()): Promise<void> {
 	await mkdir(dir, { recursive: true, mode: 0o700 });
 	await chmod(dir, 0o700);
-	const path = statePath(dir); const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
+	const path = statePath(dir); const temporary = `${path}.${randomUUID()}.tmp`;
 	await writeFile(temporary, `${JSON.stringify(state)}\n`, { encoding: "utf8", mode: 0o600 });
 	await chmod(temporary, 0o600);
 	await rename(temporary, path);
@@ -66,19 +66,59 @@ export async function ensureBridge(port = DEFAULT_PORT, requirePort = false): Pr
 		if (requirePort && existing.port !== port) throw new Error(`web: bridge already runs on port ${existing.port}; use /web on or stop every connected agent first`);
 		return existing;
 	}
-	const here = dirname(fileURLToPath(import.meta.url));
-	const child = spawn(process.execPath, [join(here, "server.mjs")], {
-		detached: true,
-		stdio: "ignore",
-		env: { ...process.env, PI_WEB_RUNTIME_DIR: runtimeDir(), PI_WEB_PORT: String(port) },
-	});
-	child.unref();
-	for (let attempt = 0; attempt < 80; attempt++) {
-		await sleep(100);
-		const state = await readBridgeState();
-		if (state && await bridgeIsHealthy(state)) return state;
+	const dir = runtimeDir();
+	await mkdir(dir, { recursive: true, mode: 0o700 });
+	const lock = join(dir, "startup.lock");
+	const deadline = Date.now() + 12_000;
+	while (true) {
+		try { await mkdir(lock, { mode: 0o700 }); break; }
+		catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			const state = await readBridgeState();
+			if (state && await bridgeIsHealthy(state)) {
+				if (requirePort && state.port !== port) throw new Error(`web: bridge already runs on port ${state.port}`);
+				return state;
+			}
+			// Only reclaim an old abandoned lock, never an in-progress startup.
+			try {
+				const owner = JSON.parse(await readFile(join(lock, "owner.json"), "utf8")) as { pid: number; childPid?: number };
+				const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code !== "ESRCH"; } };
+				if (!alive(owner.pid) && (!owner.childPid || !alive(owner.childPid))) { await rm(lock, { recursive: true, force: true }); continue; }
+			} catch { try { if (Date.now() - (await stat(lock)).mtimeMs > 30_000) { await rm(lock, { recursive: true, force: true }); continue; } } catch {} }
+			if (Date.now() >= deadline) throw new Error("web: timed out waiting for bridge startup lock");
+			await sleep(100);
+		}
 	}
-	throw new Error(`web: bridge did not become available on https://localhost:${port}`);
+	try {
+		await writeFile(join(lock, "owner.json"), JSON.stringify({ pid: process.pid }), { mode: 0o600 });
+		const healthy = await readBridgeState();
+		if (healthy && await bridgeIsHealthy(healthy)) {
+			if (requirePort && healthy.port !== port) throw new Error(`web: bridge already runs on port ${healthy.port}`);
+			return healthy;
+		}
+		const here = dirname(fileURLToPath(import.meta.url));
+		const child = spawn(process.execPath, [join(here, "server.mjs")], {
+			detached: true, stdio: "ignore", env: { ...process.env, PI_WEB_RUNTIME_DIR: dir, PI_WEB_PORT: String(port) },
+		});
+		let failure: Error | undefined;
+		const onError = (error: Error) => { failure = error; };
+		const onExit = (code: number | null) => { failure = new Error(`web: bridge exited during startup (${code})`); };
+		child.once("error", onError); child.once("exit", onExit); child.unref();
+		try {
+			await writeFile(join(lock, "owner.json"), JSON.stringify({ pid: process.pid, childPid: child.pid }), { mode: 0o600 });
+			for (let attempt = 0; attempt < 80; attempt++) {
+				await sleep(100);
+				const state = await readBridgeState();
+				if (state && await bridgeIsHealthy(state)) {
+					if (requirePort && state.port !== port) throw new Error(`web: bridge already runs on port ${state.port}`);
+					return state;
+				}
+				if (failure) throw failure;
+			}
+			throw new Error(`web: bridge did not become available on https://localhost:${port}`);
+		} catch (error) { child.kill("SIGTERM"); throw error; }
+		finally { child.removeListener("error", onError); child.on("error", () => {}); child.removeListener("exit", onExit); }
+	} finally { await rm(lock, { recursive: true, force: true }); }
 }
 
 export async function runtimeFilesArePrivate(dir = runtimeDir()): Promise<boolean> {

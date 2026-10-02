@@ -20,8 +20,8 @@ const EVENT_MAX_CHARS = 64 * 1024;
 function plain(value: unknown, maxChars = EVENT_MAX_CHARS): unknown { return compactForTransport(value, maxChars); }
 function serializedLength(value: unknown): number { try { return JSON.stringify(value).length; } catch { return Number.POSITIVE_INFINITY; } }
 
-function history(ctx: ExtensionContext): unknown[] {
-	const entries = ctx.sessionManager.getEntries().flatMap((entry) => {
+export function history(ctx: ExtensionContext): unknown[] {
+	const entries = ctx.sessionManager.getBranch().flatMap((entry) => {
 		const candidate = entry as { type?: unknown; id?: unknown; message?: unknown };
 		return candidate.type === "message" && candidate.message ? [{ id: candidate.id, message: candidate.message }] : [];
 	});
@@ -144,8 +144,12 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("session_start", async (_event, ctx) => { current = ctx; });
-	pi.on("session_shutdown", async () => { enabled = false; pendingInputs.length = 0; pendingInputChars = 0; bridge.disconnect(); current = undefined; });
+	pi.on("session_start", async (_event, ctx) => {
+		current = ctx; dispatching = false; pendingInputs.length = 0; pendingInputChars = 0; writePaths.clear();
+		if (enabled) { bridge.disconnect(); try { await bridge.connect(metadata(pi, ctx)); } catch (error) { enabled = false; ctx.ui.notify(`Unable to reconnect Pi Web: ${String(error)}`, "error"); } }
+	});
+	pi.on("session_tree", async (_event, ctx) => { current = ctx; if (enabled) bridge.update({ history: history(ctx) }); });
+	pi.on("session_shutdown", async () => { enabled = false; dispatching = false; pendingInputs.length = 0; pendingInputChars = 0; writePaths.clear(); bridge.disconnect(); current = undefined; });
 	pi.on("session_info_changed", async (_event, ctx) => { if (enabled) bridge.update(metadata(pi, ctx)); });
 	pi.on("model_select", async (_event, ctx) => { if (enabled) bridge.update(metadata(pi, ctx)); });
 	pi.on("agent_start", async (_event, ctx) => { current = ctx; if (enabled) bridge.emit("agent_start", {}); });
