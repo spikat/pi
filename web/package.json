@@ -1,6 +1,6 @@
 {
   "name": "@spikat/pi-web",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Local HTTPS bridge and live web dashboard for Pi sessions",
   "license": "MIT",
   "type": "module",
@@ -33,17 +33,17 @@
     "check": "tsc --noEmit"
   },
   "dependencies": {
-    "selfsigned": "^2.4.1",
-    "ws": "^8.18.1"
+    "selfsigned": "^5.5.0",
+    "ws": "^8.22.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@types/node": "^22.15.0",
-    "@types/ws": "^8.5.13",
-    "tsx": "^4.19.3",
-    "typescript": "^5.8.3"
+    "@types/node": "^22.20.5",
+    "@types/ws": "^8.18.2",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
   },
   "pi": {
     "extensions": [

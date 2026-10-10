@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { X509Certificate } from "node:crypto";
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { createPrivateKey, X509Certificate } from "node:crypto";
+import { mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer as createNetServer } from "node:net";
 import { request } from "node:https";
 import { tmpdir } from "node:os";
@@ -34,18 +34,68 @@ function get(options: Parameters<typeof request>[1]): Promise<{ status: number; 
 function nextMessage(socket: WebSocket): Promise<Record<string, unknown>> { return new Promise((resolve) => socket.once("message", (value) => resolve(JSON.parse(String(value)) as Record<string, unknown>))); }
 function open(url: string, options: WebSocket.ClientOptions): Promise<WebSocket> { return new Promise((resolve, reject) => { const socket = new WebSocket(url, options); socket.once("open", () => resolve(socket)); socket.once("error", reject); }); }
 
-for (const failure of ["near expiry", "mismatched key"]) test(`HTTPS bridge renews certificates with ${failure}`, async () => {
+function assertLocalCertificate(cert: string, key: string) {
+	const parsed = new X509Certificate(cert);
+	assert.equal(parsed.checkHost("localhost"), "localhost");
+	assert.equal(parsed.checkIP("127.0.0.1"), "127.0.0.1");
+	assert.equal(parsed.checkPrivateKey(createPrivateKey(key)), true);
+	assert.equal(parsed.verify(parsed.publicKey), true);
+	assert.equal(parsed.publicKey.asymmetricKeyType, "rsa");
+	assert.equal(parsed.publicKey.asymmetricKeyDetails?.modulusLength, 2048);
+	const start = Date.parse(parsed.validFrom), end = Date.parse(parsed.validTo);
+	assert.ok(start <= Date.now());
+	assert.equal(end - start, 365 * 24 * 60 * 60 * 1000);
+	assert.ok(end > Date.now() + 364 * 24 * 60 * 60 * 1000);
+	// DER OID for sha256WithRSAEncryption (1.2.840.113549.1.1.11).
+	assert.ok(parsed.raw.includes(Buffer.from("06092a864886f70d01010b", "hex")));
+}
+
+for (const failure of ["near expiry", "mismatched key", "malformed certificate"]) test(`HTTPS bridge renews certificates with ${failure}`, async () => {
 	const runtime = await mkdtemp(join(tmpdir(), "pi-web-")); const port = await freePort();
-	const expiring = selfsigned.generate([{ name: "commonName", value: "localhost" }], { days: failure === "near expiry" ? 1 : 365, keySize: 2048 });
-	const key = failure === "mismatched key" ? selfsigned.generate([{ name: "commonName", value: "localhost" }], { days: 365, keySize: 2048 }).private : expiring.private;
+	const expiring = await selfsigned.generate([{ name: "commonName", value: "localhost" }], {
+		notAfterDate: new Date(Date.now() + (failure === "near expiry" ? 1 : 365) * 24 * 60 * 60 * 1000),
+		keySize: 2048, algorithm: "sha256",
+	});
+	const key = failure === "mismatched key" ? (await selfsigned.generate([{ name: "commonName", value: "localhost" }], { keySize: 2048, algorithm: "sha256" })).private : expiring.private;
+	const originalCert = failure === "malformed certificate" ? "not a certificate" : expiring.cert;
 	await writeFile(join(runtime, "localhost-key.pem"), key);
-	await writeFile(join(runtime, "localhost-cert.pem"), expiring.cert);
+	await writeFile(join(runtime, "localhost-cert.pem"), originalCert);
 	const child = spawn(process.execPath, [join(process.cwd(), "server.mjs")], { cwd: join(process.cwd()), env: { ...process.env, PI_WEB_RUNTIME_DIR: runtime, PI_WEB_PORT: String(port) }, stdio: "ignore" });
 	try {
 		await eventually(async () => { try { return JSON.parse(await readFile(join(runtime, "bridge.json"), "utf8")) as Record<string, unknown>; } catch { return undefined; } });
 		const renewed = await readFile(join(runtime, "localhost-cert.pem"), "utf8");
-		assert.notEqual(renewed, expiring.cert);
-		assert.ok(Date.parse(new X509Certificate(renewed).validTo) > Date.now() + 300 * 24 * 60 * 60 * 1000);
+		assert.notEqual(renewed, originalCert);
+		assertLocalCertificate(renewed, await readFile(join(runtime, "localhost-key.pem"), "utf8"));
+	} finally { child.kill("SIGTERM"); await rm(runtime, { recursive: true, force: true }); }
+});
+
+test("HTTPS bridge creates private, year-long SHA-256 localhost certificates", async () => {
+	const runtime = await mkdtemp(join(tmpdir(), "pi-web-")); const port = await freePort();
+	const child = spawn(process.execPath, [join(process.cwd(), "server.mjs")], { env: { ...process.env, PI_WEB_RUNTIME_DIR: runtime, PI_WEB_PORT: String(port) }, stdio: "ignore" });
+	try {
+		const state = await eventually(async () => { try { return JSON.parse(await readFile(join(runtime, "bridge.json"), "utf8")) as { agentToken: string }; } catch { return undefined; } });
+		const keyFile = join(runtime, "localhost-key.pem"), certFile = join(runtime, "localhost-cert.pem");
+		assertLocalCertificate(await readFile(certFile, "utf8"), await readFile(keyFile, "utf8"));
+		if (process.platform !== "win32") {
+			assert.equal((await stat(runtime)).mode & 0o777, 0o700);
+			assert.equal((await stat(keyFile)).mode & 0o777, 0o600);
+			assert.equal((await stat(certFile)).mode & 0o777, 0o600);
+		}
+		assert.equal((await get({ hostname: "127.0.0.1", port, path: "/health", rejectUnauthorized: false, headers: { "x-pi-web-agent-token": state.agentToken } })).status, 204);
+	} finally { child.kill("SIGTERM"); await rm(runtime, { recursive: true, force: true }); }
+});
+
+test("HTTPS bridge retains valid certificates with legacy PKCS#1 private keys", async () => {
+	const runtime = await mkdtemp(join(tmpdir(), "pi-web-")); const port = await freePort();
+	const pems = await selfsigned.generate([{ name: "commonName", value: "localhost" }], { algorithm: "sha256", keySize: 2048 });
+	const legacyKey = createPrivateKey(pems.private).export({ type: "pkcs1", format: "pem" }).toString();
+	await writeFile(join(runtime, "localhost-key.pem"), legacyKey);
+	await writeFile(join(runtime, "localhost-cert.pem"), pems.cert);
+	const child = spawn(process.execPath, [join(process.cwd(), "server.mjs")], { env: { ...process.env, PI_WEB_RUNTIME_DIR: runtime, PI_WEB_PORT: String(port) }, stdio: "ignore" });
+	try {
+		await eventually(async () => { try { return JSON.parse(await readFile(join(runtime, "bridge.json"), "utf8")) as Record<string, unknown>; } catch { return undefined; } });
+		assert.equal(await readFile(join(runtime, "localhost-key.pem"), "utf8"), legacyKey);
+		assert.equal(await readFile(join(runtime, "localhost-cert.pem"), "utf8"), pems.cert);
 	} finally { child.kill("SIGTERM"); await rm(runtime, { recursive: true, force: true }); }
 });
 

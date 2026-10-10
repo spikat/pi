@@ -57,7 +57,12 @@ async function startFiles() {
     renew = !key.length || certificateNeedsRenewal(cert) || !new X509Certificate(cert).checkPrivateKey(createPrivateKey(key));
   } catch { renew = true; }
   if (renew) {
-    const pems = selfsigned.generate([{ name: "commonName", value: "localhost" }], { days: CERTIFICATE_DAYS, keySize: 2048, extensions: [{ name: "subjectAltName", altNames: [{ type: 2, value: "localhost" }, { type: 7, ip: "127.0.0.1" }] }] });
+    const notBeforeDate = new Date();
+    const notAfterDate = new Date(notBeforeDate.getTime() + CERTIFICATE_DAYS * 24 * 60 * 60 * 1000);
+    const pems = await selfsigned.generate([{ name: "commonName", value: "localhost" }], {
+      notBeforeDate, notAfterDate, keySize: 2048, algorithm: "sha256",
+      extensions: [{ name: "subjectAltName", altNames: [{ type: 2, value: "localhost" }, { type: 7, ip: "127.0.0.1" }] }],
+    });
     await privateWrite(keyFile, pems.private); await privateWrite(certFile, pems.cert);
   }
   return { key: await readFile(keyFile), cert: await readFile(certFile) };

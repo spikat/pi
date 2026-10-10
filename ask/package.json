@@ -1,6 +1,6 @@
 {
   "name": "@spikat/pi-ask",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Ask Pi a question while preventing file modifications",
   "license": "MIT",
   "type": "module",
@@ -38,8 +38,8 @@
     "access": "public"
   },
   "devDependencies": {
-    "@types/node": "^22.15.0",
-    "tsx": "^4.19.3",
-    "typescript": "^5.8.3"
+    "@types/node": "^22.20.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
   }
 }

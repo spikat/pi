@@ -31,7 +31,7 @@ Open that exact URL in a browser. The bridge uses a generated self-signed certif
 /web status        Report whether the current session is connected.
 ```
 
-The first `on` command selects the port. Startup is serialized with an interprocess lock; concurrent sessions discover the same healthy bridge and revalidate any explicit port. Certificate files are replaced atomically. While a bridge has connected agents, another explicit port is rejected rather than silently splitting the dashboard into two local bridges. Use `/web on` in subsequent sessions to join it.
+The first `on` command selects the port. Startup is serialized with an interprocess lock; concurrent sessions discover the same healthy bridge and revalidate any explicit port. Certificates are generated asynchronously with RSA-2048/SHA-256, cover `localhost` and `127.0.0.1`, and are valid for 365 days. Missing, malformed, mismatched, or nearly expired certificates are renewed; existing valid certificates and legacy PKCS#1 private keys remain usable. Certificate files are replaced atomically. While a bridge has connected agents, another explicit port is rejected rather than silently splitting the dashboard into two local bridges. Use `/web on` in subsequent sessions to join it.
 
 The bridge stops automatically a few seconds after the last connected Pi session exits or runs `/web off`. During local development, the detached bridge keeps the `server.mjs` code it loaded at startup; run `/web off` in every connected Pi session, wait a few seconds for the shared server to stop, then run `/web on` again (and reload the browser) after changing dashboard code.
 

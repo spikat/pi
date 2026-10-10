@@ -57,6 +57,21 @@ pi
 
 Replace `commit-msg` with the extension you want. If Pi is already running, use `/reload` after copying it.
 
+### Dependency maintenance
+
+Use the project-local Pi skill from the repository root:
+
+```text
+/reload
+/skill:update-deps
+```
+
+The skill guides updates across all extensions, including major dependency
+upgrades, supply-chain and installation-script review, API migrations, package
+version bumps, and full test validation. It reports unverifiable or deferred
+updates rather than bypassing security checks. See
+[the workflow](./.pi/skills/update-deps/SKILL.md).
+
 ## Detailed documentation
 
 Each extension has its own README:
